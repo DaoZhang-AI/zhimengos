@@ -148,7 +148,8 @@
    想换成闪的话把下面这段 keyframes 换掉就行,别处不用动。 */
 #zos_ball_bell {
     position: absolute;
-    inset: 0;
+    top: 0;
+    left: 0;
     width: 100%;
     height: 100%;
     object-fit: contain;
@@ -175,23 +176,38 @@
  * 结构是外面一圈白壳、里面一块黑屏,照道长给的那张实物图。
  * ========================================================================== */
 
+/* ⚠️⚠️ 这里**绝对不能用 inset: 0**(2026-08-18 实测抓到)。
+ *
+ * 酒馆的 <html> 上挂着 transform 和 perspective,这会让 <html> 变成所有
+ * position:fixed 后代的**定位祖先**,而它的高度是 0。于是 inset:0 算出来的
+ * 高度就是 0,配上 overflow:auto,整台手机被裁成一条缝,看着就是"消失了"。
+ *
+ * 视口单位不看定位祖先,所以用 vw/vh 才稳。dvh 那行给新浏览器,
+ * 老 Safari 不认会自动落回上面那行。 */
 #zos_phone_wrap {
     position: fixed;
-    inset: 0;
+    top: 0;
+    left: 0;
+    width: 100vw;
+    height: 100vh;
+    height: 100dvh;
     z-index: 3100;
     display: flex;
     align-items: center;
     justify-content: center;
-    /* 保险:万一尺寸算大了,让它能滚而不是把顶部吃掉。
-       flex 居中一旦溢出,溢出的那一半在上面,是滚不到的,所以必须配下面那句 margin auto。
-       (2026-08-18 iPad 上就是顶部被截断) */
+    /* 保险:万一尺寸还是算大了,让它能滚而不是把顶部吃掉。
+       flex 居中一旦溢出,溢出的那一半在上面且滚不到,所以必须配手机那句 margin auto。 */
     overflow: auto;
     padding: 6px 0;
 }
 
+/* 同理,inset 在有些移动端 WebView 上也不认,写全四个方向更保险 */
 #zos_backdrop {
     position: absolute;
-    inset: 0;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    left: 0;
     background-color: rgba(0, 0, 0, 0.55);
     backdrop-filter: blur(2px);
 }
@@ -349,7 +365,9 @@
 .zos_bat::before {
     content: '';
     position: absolute;
-    inset: 2px;
+    top: 2px;
+    left: 2px;
+    bottom: 2px;
     width: 68%;
     border-radius: 1px;
     background-color: var(--zos-ink);

@@ -21,7 +21,7 @@ import { writeSecret, SECRET_KEYS } from '../../../secrets.js';
 import { uuidv4 } from '../../../utils.js';
 
 /** 跟 manifest.json 的 version 手动保持一致,靠这行在控制台辨认在跑哪一版 */
-const VERSION = '0.8.0';
+const VERSION = '0.9.0';
 
 /** 必须和仓库名、文件夹名一致,理由见织梦者里那段注释 */
 const MODULE_NAME = 'zhimengos';
@@ -1069,6 +1069,13 @@ function applyBallPosition() {
     const ball = document.getElementById('zos_ball');
     if (!ball) return;
 
+    // 页面还没量好尺寸时 innerWidth 可能是 0,这时候摆会把球钉在左上角。
+    // 等一帧再来,别在这一刻算(2026-08-18 抓到过)
+    if (!window.innerWidth || !window.innerHeight) {
+        requestAnimationFrame(() => applyBallPosition());
+        return;
+    }
+
     const settings = getSettings();
     const width = ball.offsetWidth || 38;
     const height = ball.offsetHeight || 70;
@@ -1205,6 +1212,98 @@ function setBallUnread(unread) {
 
     // 铃铛没抠出来,退回整张换图
     img.src = unreadNow ? BALL_IMAGE_NEW : BALL_IMAGE_IDLE;
+}
+
+/* ==========================================================================
+ * 自己更新自己
+ *
+ * 由来(2026-08-18 道长):"在用户下载其他插件之后,也应该能在插件本身那里点更新,
+ * 而不是只能在织梦者里。" 装了织梦者的人两条路都有,没装的人也不至于没法更新。
+ *
+ * ⚠️ /api/extensions/version 对"不是 git 仓库"的目录会返回 200 加一串空字符串,
+ * 而且 isUpToDate 给的是 true。所以判断能不能更新要看 currentCommitHash 有没有值,
+ * **不能看 isUpToDate**,否则手动解压装的会显示"已是最新",点更新又必然失败。
+ * ========================================================================== */
+
+/** 自己是装在全局目录还是用户目录 */
+async function selfType() {
+    try {
+        const response = await fetch('/api/extensions/discover');
+        if (!response.ok) return 'global';
+
+        const list = await response.json();
+        const hit = (Array.isArray(list) ? list : [])
+            .find(x => String(x?.name || '').toLowerCase() === `third-party/${MODULE_NAME}`);
+
+        return hit?.type || 'global';
+    } catch {
+        return 'global';
+    }
+}
+
+async function checkSelfUpdate() {
+    const $out = $('#zos_self_out');
+    $out.html('<div class="zos_hint">正在查...</div>');
+
+    try {
+        const type = await selfType();
+        const response = await fetch('/api/extensions/version', {
+            method: 'POST',
+            headers: getRequestHeaders(),
+            body: JSON.stringify({ extensionName: MODULE_NAME, global: type === 'global' }),
+        });
+
+        const data = response.ok ? await response.json() : null;
+        const hash = String(data?.currentCommitHash || '');
+
+        if (!hash) {
+            $out.html('<div class="zos_hint zos_bad">这份是手动放进去的,没有 git,更新不了。' +
+                '<br>要能一键更新的话,用酒馆的「安装扩展」重装一次即可。</div>');
+            return;
+        }
+
+        const branch = escapeHtml(String(data?.currentBranchName || '?'));
+        const short = escapeHtml(hash.slice(0, 7));
+
+        $out.html(data?.isUpToDate
+            ? `<div class="zos_hint">${branch} · ${short} · 已是最新</div>
+               <div class="zos_buttons"><div id="zos_self_update" class="menu_button" data-global="${type === 'global'}">还是更新一下</div></div>`
+            : `<div class="zos_hint">${branch} · ${short} · <b>有新版</b></div>
+               <div class="zos_buttons"><div id="zos_self_update" class="menu_button" data-global="${type === 'global'}">更新</div></div>`);
+    } catch (error) {
+        $out.html(`<div class="zos_hint zos_bad">查不了:${escapeHtml(String(error?.message || error))}</div>`);
+    }
+}
+
+async function doSelfUpdate() {
+    const isGlobal = String($('#zos_self_update').data('global')) === 'true';
+    $('#zos_self_update').text('更新中...');
+
+    try {
+        const response = await fetch('/api/extensions/update', {
+            method: 'POST',
+            headers: getRequestHeaders(),
+            body: JSON.stringify({ extensionName: MODULE_NAME, global: isGlobal }),
+        });
+
+        const text = await response.text();
+
+        if (!response.ok) {
+            // 把酒馆的原话给她,别自己编
+            await callGenericPopup(
+                `<div class="zos_popup"><div class="zos_bad">更新失败。</div>
+                <div class="zos_hint">酒馆的原话:</div>
+                <div class="zos_reason">${escapeHtml(text || response.statusText)}</div></div>`,
+                POPUP_TYPE.TEXT, '', { okButton: '知道了', wide: true });
+            return;
+        }
+
+        await callGenericPopup(
+            '<div class="zos_popup">更新完了。<br><b>要刷新一次页面</b>才会跑新代码。</div>',
+            POPUP_TYPE.TEXT, '', { okButton: '知道了' });
+    } finally {
+        await checkSelfUpdate();
+    }
 }
 
 /* ==========================================================================
@@ -1415,6 +1514,13 @@ function renderPanel() {
             </div>
             <div class="inline-drawer-content">
 
+                <div class="zos_hint">当前版本 v${VERSION}</div>
+                <div class="zos_buttons">
+                    <div id="zos_self_check" class="menu_button">查看更新</div>
+                </div>
+                <div id="zos_self_out"></div>
+
+                <hr>
                 <b>入口</b>
                 <div class="zos_buttons">
                     <div id="zos_open" class="menu_button">打开手机</div>
@@ -1495,6 +1601,9 @@ function renderPanel() {
     $('#extensions_settings').append(html);
 
     $('#zos_open').on('click', () => togglePhone());
+    $('#zos_self_check').on('click', () => checkSelfUpdate());
+    // 更新按钮是查完才画出来的,所以委托在容器上
+    $('#zos_self_out').on('click', '#zos_self_update', () => doSelfUpdate());
 
     $('#zos_ball_hidden').on('input', function () {
         getSettings().ballHidden = Boolean($(this).prop('checked'));
