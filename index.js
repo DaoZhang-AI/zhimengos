@@ -12,14 +12,15 @@
  */
 
 import { extension_settings } from '../../../extensions.js';
-import { saveSettingsDebounced, getRequestHeaders, characters, getThumbnailUrl } from '../../../../script.js';
+import { saveSettingsDebounced, getRequestHeaders, characters, getThumbnailUrl, chat_metadata, saveMetadata } from '../../../../script.js';
+import { eventSource, event_types } from '../../../events.js';
 import { uploadFileAttachment } from '../../../chats.js';
 import { callGenericPopup, POPUP_TYPE } from '../../../popup.js';
 import { writeSecret, SECRET_KEYS } from '../../../secrets.js';
 import { uuidv4 } from '../../../utils.js';
 
 /** 跟 manifest.json 的 version 手动保持一致,靠这行在控制台辨认在跑哪一版 */
-const VERSION = '0.5.0';
+const VERSION = '0.6.0';
 
 /** 必须和仓库名、文件夹名一致,理由见织梦者里那段注释 */
 const MODULE_NAME = 'zhimengos';
@@ -275,6 +276,8 @@ const APPS = [
  * ========================================================================== */
 
 const STORE_FILE = 'zhimengos-contacts.json';
+/** 聊天元数据里给我们留的那个键 */
+const META_KEY = 'zhimengos';
 
 /**
  * @typedef {object} Contact
@@ -283,11 +286,37 @@ const STORE_FILE = 'zhimengos-contacts.json';
  * @property {string} nick      手机里显示的名字,可以和卡名不一样
  * @property {string} avatar    自定义头像地址。空 = 借角色卡的头像
  * @property {string} persona   线上人设。空 = 用角色卡自己的设定
+ * @property {boolean} global   运行时标记,不落盘。真 = 这条来自常驻名单
  * @property {Array<{from: string, text: string, time: string}>} messages
  */
 
-/** @type {Contact[]} 内存里的那一份,界面只认它 */
-let contacts = [];
+/** @type {Contact[]} 只在这个聊天里的,存在聊天文件的元数据里 */
+let localContacts = [];
+/** @type {Contact[]} 常驻名单,存在全局那个文件里,哪个聊天都出现 */
+let globalContacts = [];
+
+/** 界面只认这一份:本聊天的排前面,常驻的排后面 */
+function allContacts() {
+    return [
+        ...localContacts.map(c => ({ ...c, global: false })),
+        ...globalContacts.map(c => ({ ...c, global: true })),
+    ];
+}
+
+/** 改数据要找到它真正待的那个数组,不能改 allContacts 复制出来的那份 */
+function bucketOf(id) {
+    if (localContacts.some(c => c.id === id)) return localContacts;
+    if (globalContacts.some(c => c.id === id)) return globalContacts;
+    return null;
+}
+
+function contactById(id) {
+    return localContacts.find(c => c.id === id) || globalContacts.find(c => c.id === id) || null;
+}
+
+function isGlobal(id) {
+    return globalContacts.some(c => c.id === id);
+}
 
 function utf8ToBase64(text) {
     const bytes = new TextEncoder().encode(text);
@@ -299,31 +328,49 @@ function utf8ToBase64(text) {
     return btoa(binary);
 }
 
-async function loadContacts() {
+/* ---------- 本聊天那一份:存在聊天文件里 ---------- */
+
+function loadLocal() {
+    const data = chat_metadata?.[META_KEY];
+    localContacts = Array.isArray(data?.contacts) ? data.contacts : [];
+}
+
+async function saveLocal() {
+    if (!chat_metadata) return;
+
+    if (!chat_metadata[META_KEY]) chat_metadata[META_KEY] = {};
+    chat_metadata[META_KEY].contacts = localContacts;
+
+    await saveMetadata();
+}
+
+/* ---------- 常驻那一份:存在用户自己的文件目录 ---------- */
+
+async function loadGlobal() {
     const path = getSettings().storePath || `user/files/${STORE_FILE}`;
 
     try {
         // 加个时间戳破缓存,否则改完刷新还是旧的
         const response = await fetch(`/${path}?t=${new Date().getTime()}`, { cache: 'no-cache' });
         if (!response.ok) {
-            contacts = [];
+            globalContacts = [];
             return;
         }
 
         const data = await response.json();
-        contacts = Array.isArray(data?.contacts) ? data.contacts : [];
+        globalContacts = Array.isArray(data?.contacts) ? data.contacts : [];
     } catch {
         // 头一回用的时候本来就没有这个文件,不是错
-        contacts = [];
+        globalContacts = [];
     }
 }
 
-async function saveContacts() {
-    const json = JSON.stringify({ version: 1, contacts }, null, 2);
+async function saveGlobal() {
+    const json = JSON.stringify({ version: 1, contacts: globalContacts }, null, 2);
     const path = await uploadFileAttachment(STORE_FILE, utf8ToBase64(json));
 
     if (!path) {
-        console.error('[织梦OS] 联系人没存进去');
+        console.error('[织梦OS] 常驻名单没存进去');
         return false;
     }
 
@@ -332,15 +379,17 @@ async function saveContacts() {
     return true;
 }
 
+/** 改完哪一边就存哪一边,别每次两个文件都写一遍 */
+async function saveWhere(id) {
+    if (isGlobal(id)) await saveGlobal();
+    else await saveLocal();
+}
+
 /** 头像:自己设过就用自己的,没设过就借角色卡的 */
 function avatarOf(contact) {
     if (contact.avatar) return contact.avatar;
     if (contact.avatarKey) return getThumbnailUrl('avatar', contact.avatarKey);
     return '';
-}
-
-function contactById(id) {
-    return contacts.find(c => c.id === id) || null;
 }
 
 function nowClock() {
@@ -363,7 +412,9 @@ function renderHome() {
 }
 
 function renderChatList() {
-    const rows = contacts.map(c => {
+    const list = allContacts();
+
+    const rows = list.map(c => {
         const last = c.messages?.length ? c.messages[c.messages.length - 1] : null;
         const avatar = avatarOf(c);
 
@@ -373,7 +424,7 @@ function renderChatList() {
                 ? `<img src="${escapeHtml(avatar)}" alt="">`
                 : escapeHtml((c.nick || '?').slice(0, 1))}</div>
             <div class="zos_chat_mid">
-                <div class="zos_chat_name">${escapeHtml(c.nick || '(没名字)')}</div>
+                <div class="zos_chat_name">${escapeHtml(c.nick || '(没名字)')}${c.global ? '<span class="zos_tag">常驻</span>' : ''}</div>
                 <div class="zos_chat_last">${escapeHtml(last ? last.text : '还没聊过')}</div>
             </div>
             <div class="zos_chat_right">
@@ -394,7 +445,7 @@ function renderChatList() {
             <div class="zos_appbar_title">聊天</div>
             <div class="zos_appbar_right"><div class="zos_add" title="加联系人">+</div></div>
         </div>
-        <div class="zos_list">${contacts.length ? rows : empty}</div>`;
+        <div class="zos_list">${list.length ? rows : empty}</div>`;
 }
 
 function renderChatRoom() {
@@ -462,6 +513,14 @@ function renderContactEdit() {
                 <textarea id="zos_edit_persona" rows="7" placeholder="留空就用角色卡自己的设定。&#10;填了的话,他在手机里就按这一段来,和线下那份分开。">${escapeHtml(c.persona || '')}</textarea>
             </label>
             <div class="zos_form_hint">线上和线下未必是同一个人,这一栏就是为这个留的。</div>
+
+            <div class="zos_form_row">
+                <span>这个人待在哪</span>
+                <div class="zos_form_hint">${c.global
+                    ? '<b>常驻</b>。哪个聊天都能看到他,聊天记录也是同一份,换角色卡也带得走。'
+                    : '<b>只在这个聊天里</b>。换个开场白、换个聊天就没有他,和这一局的剧情绑在一起。'}</div>
+                <div id="zos_edit_move" class="zos_btn_ghost">${c.global ? '收回到这个聊天' : '挪到常驻'}</div>
+            </div>
 
             <div class="zos_form_btns">
                 <div id="zos_edit_save" class="zos_btn_main">保存</div>
@@ -549,6 +608,7 @@ function buildPhone() {
     $('#zos_screen').on('click', '#zos_edit_save', () => onSaveContact());
     $('#zos_screen').on('click', '#zos_edit_del', () => onDeleteContact());
     $('#zos_screen').on('click', '#zos_avatar_reset', () => onResetAvatar());
+    $('#zos_screen').on('click', '#zos_edit_move', () => onMoveContact());
     $('#zos_screen').on('change', '#zos_avatar_file', function () {
         onPickAvatar(this.files?.[0]);
     });
@@ -559,7 +619,7 @@ function buildPhone() {
 /** 从酒馆的角色列表里挑一个加进手机 */
 async function onAddContact() {
     // 已经加过的不再列出来,免得重复
-    const taken = new Set(contacts.map(c => c.avatarKey));
+    const taken = new Set(allContacts().map(c => c.avatarKey));
     const pool = characters.filter(c => c?.avatar && !taken.has(c.avatar));
 
     if (!pool.length) {
@@ -586,7 +646,10 @@ async function onAddContact() {
     const card = pool.find(c => c.avatar === avatarKey);
     if (!card) return;
 
-    contacts.push({
+    // 默认只加进这个聊天。不同开场白就是不同聊天,手机内容本来就该分开
+    // (2026-08-18 道长:"有些作者不同的开场白会有不同的聊天消息")。
+    // 要带到别的对话去,进联系人设置点「挪到常驻」。
+    localContacts.push({
         id: uuidv4(),
         avatarKey,
         nick: card.name || '',
@@ -595,7 +658,7 @@ async function onAddContact() {
         messages: [],
     });
 
-    await saveContacts();
+    await saveLocal();
     renderScreen();
 }
 
@@ -606,7 +669,7 @@ async function onSaveContact() {
     c.nick = String($('#zos_edit_nick').val() || '').trim();
     c.persona = String($('#zos_edit_persona').val() || '');
 
-    await saveContacts();
+    await saveWhere(c.id);
     goto('chat_room');
 }
 
@@ -621,11 +684,56 @@ async function onDeleteContact() {
 
     if (!ok) return;
 
-    contacts = contacts.filter(x => x.id !== c.id);
-    openChatId = null;
+    if (isGlobal(c.id)) {
+        globalContacts = globalContacts.filter(x => x.id !== c.id);
+        await saveGlobal();
+    } else {
+        localContacts = localContacts.filter(x => x.id !== c.id);
+        await saveLocal();
+    }
 
-    await saveContacts();
+    openChatId = null;
     goto('chat_list');
+}
+
+/**
+ * 在「只在这个聊天」和「常驻」之间搬。
+ *
+ * 由来(2026-08-18 道长):"手机内容跟随聊天,然后有一个入口可以把角色挪到全局里去,
+ * 就可以带到别的对话里面了。"
+ * 所以默认是隔离的,共享是显式动作,不是默认行为。
+ *
+ * **人和聊天记录一起搬**,只搬人不搬记录的话,带到别的对话里只有个空壳。
+ */
+async function onMoveContact() {
+    const c = contactById(openChatId);
+    if (!c) return;
+
+    const toGlobal = !isGlobal(c.id);
+
+    const ok = await callGenericPopup(
+        toGlobal
+            ? `<div class="zos_popup">把「${escapeHtml(c.nick || '')}」挪到常驻?<br>
+               <b>他和这段聊天记录会一起挪过去</b>,以后哪个聊天、哪张角色卡都能看到他,
+               而且大家续的是同一段记录。</div>`
+            : `<div class="zos_popup">把「${escapeHtml(c.nick || '')}」收回到当前这个聊天?<br>
+               <b>别的聊天里就看不到他了</b>,记录跟着一起收回来。</div>`,
+        POPUP_TYPE.CONFIRM, '', { okButton: toGlobal ? '挪过去' : '收回来', cancelButton: '算了' });
+
+    if (!ok) return;
+
+    if (toGlobal) {
+        localContacts = localContacts.filter(x => x.id !== c.id);
+        globalContacts.push(c);
+    } else {
+        globalContacts = globalContacts.filter(x => x.id !== c.id);
+        localContacts.push(c);
+    }
+
+    // 两边都动了,所以两边都得存
+    await saveLocal();
+    await saveGlobal();
+    renderScreen();
 }
 
 /** 换头像:图也走酒馆那个文件接口,和联系人存在同一个地方 */
@@ -649,7 +757,7 @@ async function onPickAvatar(file) {
 
         // 带时间戳,不然换了图浏览器还拿旧的那张
         c.avatar = `/${path}?t=${new Date().getTime()}`;
-        await saveContacts();
+        await saveWhere(c.id);
         renderScreen();
     } catch (error) {
         console.error('[织梦OS] 换头像失败', error);
@@ -661,7 +769,7 @@ async function onResetAvatar() {
     if (!c) return;
 
     c.avatar = '';
-    await saveContacts();
+    await saveWhere(c.id);
     renderScreen();
 }
 
@@ -669,8 +777,9 @@ async function openPhone() {
     buildPhone();
     renderScreen();
 
-    // 每次开都重读一遍:这份数据是全局的,别的标签页可能改过
-    await loadContacts();
+    // 每次开都重读一遍:常驻那份是全局的,别的标签页可能改过
+    loadLocal();
+    await loadGlobal();
     renderScreen();
 
     $('#zos_phone_wrap').removeClass('zos_hidden');
@@ -1172,6 +1281,14 @@ jQuery(async () => {
     getSettings();
     renderPanel();
     applyBall();
+
+    // 换聊天就换一部手机。切走时若手机开着,把它关掉,免得看着上一局的联系人
+    eventSource.on(event_types.CHAT_CHANGED, () => {
+        loadLocal();
+        if (!$('#zos_phone_wrap').hasClass('zos_hidden')) closePhone();
+    });
+
+    loadLocal();
 
     if (!isConnectionManagerAvailable()) {
         console.warn('[织梦OS] 酒馆自带的连接管理器不可用,只能用 API 管理器里的配置或者跟主线走');

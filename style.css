@@ -770,3 +770,25 @@
     background-color: rgba(229, 72, 77, 0.16);
     color: #ff9a9d;
 }
+
+/* 常驻联系人在列表里的小标记 */
+.zos_tag {
+    margin-left: 5px;
+    padding: 1px 5px;
+    border-radius: 6px;
+    font-size: 9px;
+    font-weight: normal;
+    vertical-align: middle;
+    background-color: rgba(255, 255, 255, 0.14);
+    color: var(--zos-ink-dim);
+}
+
+.zos_btn_ghost {
+    padding: 7px;
+    border-radius: 10px;
+    text-align: center;
+    font-size: 12px;
+    cursor: pointer;
+    border: 1px solid var(--zos-line);
+    background-color: rgba(255, 255, 255, 0.05);
+}
