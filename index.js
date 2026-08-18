@@ -21,7 +21,7 @@ import { writeSecret, SECRET_KEYS } from '../../../secrets.js';
 import { uuidv4 } from '../../../utils.js';
 
 /** 跟 manifest.json 的 version 手动保持一致,靠这行在控制台辨认在跑哪一版 */
-const VERSION = '0.9.0';
+const VERSION = '0.9.1';
 
 /** 必须和仓库名、文件夹名一致,理由见织梦者里那段注释 */
 const MODULE_NAME = 'zhimengos';
@@ -657,8 +657,25 @@ function buildPhone() {
 
 /* ---------- 联系人的增删改 ---------- */
 
+/** 联系人默认存在当前聊天里,所以必须先有个聊天。没有的话明说,别静默落空 */
+async function hasOpenChat() {
+    const context = getContext();
+    if (context?.chatId) return true;
+
+    await callGenericPopup(
+        `<div class="zos_popup">得先打开一个聊天才能加联系人。
+        <div class="zos_hint" style="margin-top:6px">因为联系人是<b>存在这个聊天里</b>的,
+        换个开场白就是另一部手机。<br>
+        <b>不必是那个角色本人的聊天</b>,随便哪个都行,加进来的人可以是任意一张卡。</div></div>`,
+        POPUP_TYPE.TEXT, '', { okButton: '知道了' });
+
+    return false;
+}
+
 /** 从酒馆的角色列表里挑一个加进手机 */
 async function onAddContact() {
+    if (!await hasOpenChat()) return;
+
     // 已经加过的不再列出来,免得重复
     const taken = new Set(allContacts().map(c => c.avatarKey));
     const pool = characters.filter(c => c?.avatar && !taken.has(c.avatar));
@@ -670,20 +687,39 @@ async function onAddContact() {
         return;
     }
 
-    const options = pool
-        .map(c => `<option value="${escapeHtml(c.avatar)}">${escapeHtml(c.name || c.avatar)}</option>`)
-        .join('');
+    // ⚠️ 这里必须自己建 DOM 并**留住引用**,不能等弹窗关了再用选择器去找。
+    // 酒馆关弹窗时会 content.innerHTML='' 再 dlg.remove()(public/scripts/popup.js:523),
+    // 那时候再 $('#...').val() 只会读到空,于是这个函数静默 return,表现就是"点了没反应"。
+    // 留住引用的话,元素即使被摘下来,它自己的 value 还在。
+    const container = document.createElement('div');
+    container.className = 'zos_popup';
 
-    const html = `<div class="zos_popup">
-        <div>把谁加进手机?</div>
-        <select id="zos_pick_char" class="text_pole" style="width:100%;margin-top:8px">${options}</select>
-        <div class="zos_hint" style="margin-top:6px">加进来之后可以单独改昵称、头像和线上人设,不会动你的角色卡。</div>
-    </div>`;
+    const title = document.createElement('div');
+    title.textContent = '把谁加进手机?';
 
-    const ok = await callGenericPopup(html, POPUP_TYPE.CONFIRM, '', { okButton: '加进来', cancelButton: '算了' });
+    const select = document.createElement('select');
+    select.className = 'text_pole';
+    select.style.width = '100%';
+    select.style.marginTop = '8px';
+
+    for (const c of pool) {
+        const option = document.createElement('option');
+        option.value = c.avatar;
+        option.textContent = c.name || c.avatar;
+        select.appendChild(option);
+    }
+
+    const hint = document.createElement('div');
+    hint.className = 'zos_hint';
+    hint.style.marginTop = '6px';
+    hint.textContent = '加进来之后可以单独改昵称、头像和线上人设,不会动你的角色卡。';
+
+    container.append(title, select, hint);
+
+    const ok = await callGenericPopup(container, POPUP_TYPE.CONFIRM, '', { okButton: '加进来', cancelButton: '算了' });
     if (!ok) return;
 
-    const avatarKey = String($('#zos_pick_char').val() || '');
+    const avatarKey = String(select.value || '');
     const card = pool.find(c => c.avatar === avatarKey);
     if (!card) return;
 
@@ -798,21 +834,37 @@ async function onWriteToCard() {
 
     const count = c.messages?.length || 0;
 
-    const html = `<div class="zos_popup">
-        把「${escapeHtml(c.nick || '')}」写进角色卡<b>${escapeHtml(here.card.name || '')}</b>?
+    // 同上:留住引用再读,别等弹窗关了去找
+    const container = document.createElement('div');
+    container.className = 'zos_popup';
+    container.innerHTML = `把「${escapeHtml(c.nick || '')}」写进角色卡<b>${escapeHtml(here.card.name || '')}</b>?
         <div class="zos_hint" style="margin-top:6px"><b>这会改动你的角色卡文件。</b>
-        写进去之后,别人拿到这张卡就自带这个联系人。</div>
-        <label class="checkbox_label" style="margin-top:8px">
-            <input id="zos_with_msgs" type="checkbox" ${count ? 'checked' : ''} ${count ? '' : 'disabled'}>
-            <span>连聊天记录一起写(现在有 ${count} 条)</span>
-        </label>
-        <div class="zos_hint">带上记录的话,玩家一开局手机里就已经聊过这些。卡也会大一点。</div>
-    </div>`;
+        写进去之后,别人拿到这张卡就自带这个联系人。</div>`;
 
-    const ok = await callGenericPopup(html, POPUP_TYPE.CONFIRM, '', { okButton: '写进去', cancelButton: '算了' });
+    const label = document.createElement('label');
+    label.className = 'checkbox_label';
+    label.style.marginTop = '8px';
+
+    const check = document.createElement('input');
+    check.type = 'checkbox';
+    check.checked = Boolean(count);
+    check.disabled = !count;
+
+    const span = document.createElement('span');
+    span.textContent = `连聊天记录一起写(现在有 ${count} 条)`;
+
+    label.append(check, span);
+
+    const tail = document.createElement('div');
+    tail.className = 'zos_hint';
+    tail.textContent = '带上记录的话,玩家一开局手机里就已经聊过这些。卡也会大一点。';
+
+    container.append(label, tail);
+
+    const ok = await callGenericPopup(container, POPUP_TYPE.CONFIRM, '', { okButton: '写进去', cancelButton: '算了' });
     if (!ok) return;
 
-    const withMessages = Boolean($('#zos_with_msgs').prop('checked'));
+    const withMessages = check.checked;
 
     const existing = cardContacts().filter(x => x.id !== c.id);
     const payload = {
