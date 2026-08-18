@@ -21,7 +21,7 @@ import { writeSecret, SECRET_KEYS } from '../../../secrets.js';
 import { uuidv4 } from '../../../utils.js';
 
 /** 跟 manifest.json 的 version 手动保持一致,靠这行在控制台辨认在跑哪一版 */
-const VERSION = '0.7.1';
+const VERSION = '0.8.0';
 
 /** 必须和仓库名、文件夹名一致,理由见织梦者里那段注释 */
 const MODULE_NAME = 'zhimengos';
@@ -48,6 +48,8 @@ const defaultSettings = {
     ballPos: null,
     /** 联系人存档文件的地址。**只存一个路径,几十字节**,真正的数据在那个文件里 */
     storePath: '',
+    /** 手机窗口被拖到哪儿了:{ left, top }。空 = 居中 */
+    phonePos: null,
 };
 
 function getSettings() {
@@ -619,6 +621,8 @@ function buildPhone() {
     $('#zos_backdrop').on('click', () => closePhone());
     $('.zos_homebar').on('click', () => goto('home'));
 
+    bindPhoneDrag();
+
     $('#zos_screen').on('click', '.zos_app', function () {
         const app = String($(this).data('app'));
         const meta = APPS.find(a => a.id === app);
@@ -921,10 +925,104 @@ async function openPhone() {
     await offerCardImport();
 
     $('#zos_phone_wrap').removeClass('zos_hidden');
+    applyPhonePosition();
 
     // 时钟只在手机开着时走,关了就停,别让它常驻烧定时器
     if (clockTimer) clearInterval(clockTimer);
     clockTimer = setInterval(() => $('#zos_clock').text(nowClock()), 20000);
+}
+
+/* ---------- 手机窗口可以拖 ----------
+ *
+ * 手柄只认**白色边框和顶部状态栏**,不是整机:屏幕里要点图标、要滑列表,
+ * 整机可拖会和这些打架。抓边框和状态栏,跟抓一台真手机的手感也对得上。
+ *
+ * 拖过之后改成绝对定位;没拖过就保持原来的居中,别让没拖过的人也吃到定位的坑。
+ */
+
+/** 这次按下去的地方算不算手柄 */
+function isPhoneHandle(target) {
+    if (!target) return false;
+    if (target.id === 'zos_phone') return true;
+    return Boolean(target.closest('.zos_btn, .zos_statusbar, .zos_notch'));
+}
+
+function applyPhonePosition() {
+    const phone = document.getElementById('zos_phone');
+    if (!phone) return;
+
+    const pos = getSettings().phonePos;
+
+    if (!pos) {
+        // 没拖过就交回给外层的居中,把内联样式清干净
+        phone.style.position = '';
+        phone.style.left = '';
+        phone.style.top = '';
+        phone.style.margin = '';
+        return;
+    }
+
+    const safe = clampToViewport(pos.left, pos.top, phone.offsetWidth, phone.offsetHeight);
+
+    phone.style.position = 'absolute';
+    phone.style.margin = '0';
+    phone.style.left = `${safe.left}px`;
+    phone.style.top = `${safe.top}px`;
+}
+
+function bindPhoneDrag() {
+    const phone = document.getElementById('zos_phone');
+    if (!phone) return;
+
+    let dragging = false;
+    let offsetX = 0;
+    let offsetY = 0;
+
+    phone.addEventListener('pointerdown', (event) => {
+        if (!isPhoneHandle(event.target)) return;
+
+        // 拖之前先固定住当前位置,不然从居中切到绝对定位的那一瞬间会跳一下
+        const rect = phone.getBoundingClientRect();
+        phone.style.position = 'absolute';
+        phone.style.margin = '0';
+        phone.style.left = `${rect.left}px`;
+        phone.style.top = `${rect.top}px`;
+
+        dragging = true;
+        offsetX = event.clientX - rect.left;
+        offsetY = event.clientY - rect.top;
+        phone.setPointerCapture(event.pointerId);
+    });
+
+    phone.addEventListener('pointermove', (event) => {
+        if (!dragging) return;
+
+        const safe = clampToViewport(
+            event.clientX - offsetX,
+            event.clientY - offsetY,
+            phone.offsetWidth,
+            phone.offsetHeight);
+
+        phone.style.left = `${safe.left}px`;
+        phone.style.top = `${safe.top}px`;
+    });
+
+    phone.addEventListener('pointerup', (event) => {
+        if (!dragging) return;
+        dragging = false;
+        phone.releasePointerCapture(event.pointerId);
+
+        getSettings().phonePos = { left: phone.offsetLeft, top: phone.offsetTop };
+        saveSettingsDebounced();
+    });
+
+    // 双击边框回到正中间,免得拖到犄角旮旯之后找不回来
+    phone.addEventListener('dblclick', (event) => {
+        if (!isPhoneHandle(event.target)) return;
+        getSettings().phonePos = null;
+        saveSettingsDebounced();
+        applyPhonePosition();
+    });
 }
 
 function isPhoneOpen() {
@@ -1057,8 +1155,11 @@ function buildBall() {
         togglePhone();
     });
 
-    // 窗口大小变了要拉回可视范围,不然球会跑到屏幕外面再也点不着
-    window.addEventListener('resize', () => applyBallPosition());
+    // 窗口大小变了要拉回可视范围,不然球会跑到屏幕外面再也点不着。手机同理
+    window.addEventListener('resize', () => {
+        applyBallPosition();
+        if (isPhoneOpen()) applyPhonePosition();
+    });
 
     applyBallPosition();
 }

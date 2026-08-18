@@ -199,6 +199,10 @@
 #zos_phone {
     position: relative;
     flex: 0 0 auto;
+    /* 手柄上要禁掉浏览器自己的触摸手势,不然手机上一拖就变成滚页面。
+       屏幕区域下面会单独放开,那里要能滑列表 */
+    touch-action: none;
+    cursor: grab;
     /* 配合外层的 overflow:auto,溢出时上下都留得住,不会只被砍上半截 */
     margin: auto;
     /* 两行都要:dvh 老一点的 Safari 不认,不认时整条声明会被丢掉,尺寸就失控。
@@ -253,7 +257,11 @@
     border-radius: 0 2px 2px 0;
 }
 
+/* 屏幕里要能滑列表,所以把上面禁掉的触摸手势放回来;
+   状态栏和刘海是手柄,再单独禁一次 */
 .zos_screen_area {
+    touch-action: auto;
+    cursor: default;
     position: relative;
     width: 100%;
     height: 100%;
@@ -267,6 +275,8 @@
 
 /* 刘海:压在屏幕最上面,里面是听筒和摄像头 */
 .zos_notch {
+    touch-action: none;
+    cursor: grab;
     position: absolute;
     top: 0;
     left: 50%;
@@ -298,6 +308,8 @@
 }
 
 .zos_statusbar {
+    touch-action: none;
+    cursor: grab;
     flex: 0 0 auto;
     height: 24px;
     padding: 0 18px;
