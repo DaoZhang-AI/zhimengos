@@ -12,13 +12,14 @@
  */
 
 import { extension_settings } from '../../../extensions.js';
-import { saveSettingsDebounced, getRequestHeaders } from '../../../../script.js';
+import { saveSettingsDebounced, getRequestHeaders, characters, getThumbnailUrl } from '../../../../script.js';
+import { uploadFileAttachment } from '../../../chats.js';
 import { callGenericPopup, POPUP_TYPE } from '../../../popup.js';
 import { writeSecret, SECRET_KEYS } from '../../../secrets.js';
 import { uuidv4 } from '../../../utils.js';
 
 /** 跟 manifest.json 的 version 手动保持一致,靠这行在控制台辨认在跑哪一版 */
-const VERSION = '0.4.3';
+const VERSION = '0.5.0';
 
 /** 必须和仓库名、文件夹名一致,理由见织梦者里那段注释 */
 const MODULE_NAME = 'zhimengos';
@@ -43,6 +44,8 @@ const defaultSettings = {
     ballHidden: false,
     /** 悬浮入口被拖到哪儿了:{ left, top },单位像素 */
     ballPos: null,
+    /** 联系人存档文件的地址。**只存一个路径,几十字节**,真正的数据在那个文件里 */
+    storePath: '',
 };
 
 function getSettings() {
@@ -254,33 +257,91 @@ const APPS = [
     { id: 'wallet', name: '钱包', icon: '💰', done: false },
 ];
 
-/** 示例数据。**只是让形态看得见**,不是真数据,接上真数据时整块换掉。 */
-const SAMPLE_CHATS = [
-    {
-        id: 'demo1',
-        name: '（示例）某个角色',
-        avatar: '🌙',
-        last: '在忙吗',
-        time: '刚刚',
-        unread: 2,
-        messages: [
-            { from: 'them', text: '在忙吗', time: '21:03' },
-            { from: 'me', text: '刚回来', time: '21:05' },
-            { from: 'them', text: '那正好,我这边也刚结束', time: '21:05' },
-        ],
-    },
-    {
-        id: 'demo2',
-        name: '（示例）网名不认识的人',
-        avatar: '🎧',
-        last: '你也在这个群里?',
-        time: '昨天',
-        unread: 0,
-        messages: [
-            { from: 'them', text: '你也在这个群里?', time: '昨天 23:41' },
-        ],
-    },
-];
+/* ==========================================================================
+ * 联系人:存在全局一个文件里,不进 settings.json
+ *
+ * 由来(2026-08-18 道长):"我倾向于存在全局某个地方,但是不要进 setting,
+ * 因为有些人可能喜欢跨角色聊天。"
+ *
+ * 落点是酒馆的 /api/files/upload(src/endpoints/files.js:43),它写进
+ * **当前用户自己的数据目录** data/<用户>/user/files/,返回一个能直接 fetch 的地址。
+ * 正好对上三条:跟聊天无关、跟角色卡无关、不会把 settings.json 撑大。
+ *
+ * **代价说在前面**:这份数据不跟着角色卡走。发卡给别人,对方手机里是空的。
+ * 所以另有一条「写进角色卡」的路给创作者用,那条走 data.extensions.zhimengos。
+ *
+ * 联系人自带一段**线上人设**,和角色卡里那个线下人设分开
+ * (道长:"线上的人设不一定和角色卡里线下的是一样的")。
+ * ========================================================================== */
+
+const STORE_FILE = 'zhimengos-contacts.json';
+
+/**
+ * @typedef {object} Contact
+ * @property {string} id
+ * @property {string} avatarKey 绑定的角色卡,用头像文件名当稳定 id
+ * @property {string} nick      手机里显示的名字,可以和卡名不一样
+ * @property {string} avatar    自定义头像地址。空 = 借角色卡的头像
+ * @property {string} persona   线上人设。空 = 用角色卡自己的设定
+ * @property {Array<{from: string, text: string, time: string}>} messages
+ */
+
+/** @type {Contact[]} 内存里的那一份,界面只认它 */
+let contacts = [];
+
+function utf8ToBase64(text) {
+    const bytes = new TextEncoder().encode(text);
+    let binary = '';
+    // 一次性 apply 整个数组在长文件上会爆栈,分块来
+    for (let i = 0; i < bytes.length; i += 0x8000) {
+        binary += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+    }
+    return btoa(binary);
+}
+
+async function loadContacts() {
+    const path = getSettings().storePath || `user/files/${STORE_FILE}`;
+
+    try {
+        // 加个时间戳破缓存,否则改完刷新还是旧的
+        const response = await fetch(`/${path}?t=${new Date().getTime()}`, { cache: 'no-cache' });
+        if (!response.ok) {
+            contacts = [];
+            return;
+        }
+
+        const data = await response.json();
+        contacts = Array.isArray(data?.contacts) ? data.contacts : [];
+    } catch {
+        // 头一回用的时候本来就没有这个文件,不是错
+        contacts = [];
+    }
+}
+
+async function saveContacts() {
+    const json = JSON.stringify({ version: 1, contacts }, null, 2);
+    const path = await uploadFileAttachment(STORE_FILE, utf8ToBase64(json));
+
+    if (!path) {
+        console.error('[织梦OS] 联系人没存进去');
+        return false;
+    }
+
+    getSettings().storePath = path;
+    saveSettingsDebounced();
+    return true;
+}
+
+/** 头像:自己设过就用自己的,没设过就借角色卡的 */
+function avatarOf(contact) {
+    if (contact.avatar) return contact.avatar;
+    if (contact.avatarKey) return getThumbnailUrl('avatar', contact.avatarKey);
+    return '';
+}
+
+function contactById(id) {
+    return contacts.find(c => c.id === id) || null;
+}
 
 function nowClock() {
     const d = new Date();
@@ -302,47 +363,110 @@ function renderHome() {
 }
 
 function renderChatList() {
-    const rows = SAMPLE_CHATS.map(c => `
+    const rows = contacts.map(c => {
+        const last = c.messages?.length ? c.messages[c.messages.length - 1] : null;
+        const avatar = avatarOf(c);
+
+        return `
         <div class="zos_chat_row" data-chat="${escapeHtml(c.id)}">
-            <div class="zos_avatar">${c.avatar}</div>
+            <div class="zos_avatar">${avatar
+                ? `<img src="${escapeHtml(avatar)}" alt="">`
+                : escapeHtml((c.nick || '?').slice(0, 1))}</div>
             <div class="zos_chat_mid">
-                <div class="zos_chat_name">${escapeHtml(c.name)}</div>
-                <div class="zos_chat_last">${escapeHtml(c.last)}</div>
+                <div class="zos_chat_name">${escapeHtml(c.nick || '(没名字)')}</div>
+                <div class="zos_chat_last">${escapeHtml(last ? last.text : '还没聊过')}</div>
             </div>
             <div class="zos_chat_right">
-                <div class="zos_chat_time">${escapeHtml(c.time)}</div>
-                ${c.unread ? `<div class="zos_badge">${c.unread}</div>` : ''}
+                <div class="zos_chat_time">${escapeHtml(last ? last.time : '')}</div>
             </div>
-        </div>`).join('');
+        </div>`;
+    }).join('');
+
+    const empty = `
+        <div class="zos_empty">
+            <div class="zos_empty_big">还没有联系人</div>
+            <div>点右上角的加号,从你的角色列表里挑一个加进来。</div>
+        </div>`;
 
     return `
         <div class="zos_appbar">
             <div class="zos_back" data-to="home">‹</div>
             <div class="zos_appbar_title">聊天</div>
-            <div class="zos_appbar_right"></div>
+            <div class="zos_appbar_right"><div class="zos_add" title="加联系人">+</div></div>
         </div>
-        <div class="zos_list">${rows}</div>`;
+        <div class="zos_list">${contacts.length ? rows : empty}</div>`;
 }
 
 function renderChatRoom() {
-    const chat = SAMPLE_CHATS.find(c => c.id === openChatId) || SAMPLE_CHATS[0];
+    const chat = contactById(openChatId);
+    if (!chat) return renderChatList();
 
-    const bubbles = chat.messages.map(m => `
+    const bubbles = (chat.messages || []).map(m => `
         <div class="zos_msg zos_msg_${m.from === 'me' ? 'me' : 'them'}">
             <div class="zos_bubble">${escapeHtml(m.text)}</div>
-            <div class="zos_msg_time">${escapeHtml(m.time)}</div>
+            <div class="zos_msg_time">${escapeHtml(m.time || '')}</div>
         </div>`).join('');
+
+    const empty = `<div class="zos_empty">还没有消息。<br>发消息这条路还没接上,先把人和设定配好。</div>`;
 
     return `
         <div class="zos_appbar">
             <div class="zos_back" data-to="chat_list">‹</div>
-            <div class="zos_appbar_title">${escapeHtml(chat.name)}</div>
-            <div class="zos_appbar_right"></div>
+            <div class="zos_appbar_title">${escapeHtml(chat.nick || '')}</div>
+            <div class="zos_appbar_right"><div class="zos_more" title="联系人设置">⋯</div></div>
         </div>
-        <div class="zos_msgs">${bubbles}</div>
+        <div class="zos_msgs">${chat.messages?.length ? bubbles : empty}</div>
         <div class="zos_composer">
             <input class="zos_input" type="text" placeholder="还没接上,先看形态" disabled>
             <div class="zos_send zos_send_off">发送</div>
+        </div>`;
+}
+
+/* 联系人设置:昵称、头像、以及**线上人设**
+ *
+ * 线上人设单列一栏是道长的要求(2026-08-18):
+ * "线上的人设不一定和角色卡里线下的是一样的"。
+ * 留空就用角色卡自己的设定,填了就在手机里盖过它。 */
+function renderContactEdit() {
+    const c = contactById(openChatId);
+    if (!c) return renderChatList();
+
+    const avatar = avatarOf(c);
+    const cardName = characters.find(x => x.avatar === c.avatarKey)?.name || '(卡已经不在了)';
+
+    return `
+        <div class="zos_appbar">
+            <div class="zos_back" data-to="chat_room">‹</div>
+            <div class="zos_appbar_title">联系人设置</div>
+            <div class="zos_appbar_right"></div>
+        </div>
+        <div class="zos_form">
+            <div class="zos_form_avatar">
+                <div class="zos_avatar zos_avatar_big">${avatar
+                    ? `<img src="${escapeHtml(avatar)}" alt="">`
+                    : escapeHtml((c.nick || '?').slice(0, 1))}</div>
+                <div>
+                    <div class="zos_form_hint">绑的角色卡:${escapeHtml(cardName)}</div>
+                    <label class="zos_upload">换头像<input id="zos_avatar_file" type="file" accept="image/*"></label>
+                    ${c.avatar ? '<div id="zos_avatar_reset" class="zos_link">用回角色卡的头像</div>' : ''}
+                </div>
+            </div>
+
+            <label class="zos_form_row">
+                <span>昵称</span>
+                <input id="zos_edit_nick" type="text" value="${escapeHtml(c.nick || '')}">
+            </label>
+
+            <label class="zos_form_row">
+                <span>线上人设</span>
+                <textarea id="zos_edit_persona" rows="7" placeholder="留空就用角色卡自己的设定。&#10;填了的话,他在手机里就按这一段来,和线下那份分开。">${escapeHtml(c.persona || '')}</textarea>
+            </label>
+            <div class="zos_form_hint">线上和线下未必是同一个人,这一栏就是为这个留的。</div>
+
+            <div class="zos_form_btns">
+                <div id="zos_edit_save" class="zos_btn_main">保存</div>
+                <div id="zos_edit_del" class="zos_btn_danger">删掉这个联系人</div>
+            </div>
         </div>`;
 }
 
@@ -352,6 +476,7 @@ function renderScreen() {
     if (screen === 'home') body = renderHome();
     else if (screen === 'chat_list') body = renderChatList();
     else if (screen === 'chat_room') body = renderChatRoom();
+    else if (screen === 'contact_edit') body = renderContactEdit();
 
     $('#zos_screen').html(body);
     $('#zos_phone').attr('data-screen', screen);
@@ -418,10 +543,134 @@ function buildPhone() {
     $('#zos_screen').on('click', '.zos_back', function () {
         goto(String($(this).data('to')));
     });
+
+    $('#zos_screen').on('click', '.zos_add', () => onAddContact());
+    $('#zos_screen').on('click', '.zos_more', () => goto('contact_edit'));
+    $('#zos_screen').on('click', '#zos_edit_save', () => onSaveContact());
+    $('#zos_screen').on('click', '#zos_edit_del', () => onDeleteContact());
+    $('#zos_screen').on('click', '#zos_avatar_reset', () => onResetAvatar());
+    $('#zos_screen').on('change', '#zos_avatar_file', function () {
+        onPickAvatar(this.files?.[0]);
+    });
 }
 
-function openPhone() {
+/* ---------- 联系人的增删改 ---------- */
+
+/** 从酒馆的角色列表里挑一个加进手机 */
+async function onAddContact() {
+    // 已经加过的不再列出来,免得重复
+    const taken = new Set(contacts.map(c => c.avatarKey));
+    const pool = characters.filter(c => c?.avatar && !taken.has(c.avatar));
+
+    if (!pool.length) {
+        await callGenericPopup(
+            `<div class="zos_popup">${characters.length ? '你的角色都已经加进来了。' : '酒馆里还没有角色卡。'}</div>`,
+            POPUP_TYPE.TEXT, '', { okButton: '知道了' });
+        return;
+    }
+
+    const options = pool
+        .map(c => `<option value="${escapeHtml(c.avatar)}">${escapeHtml(c.name || c.avatar)}</option>`)
+        .join('');
+
+    const html = `<div class="zos_popup">
+        <div>把谁加进手机?</div>
+        <select id="zos_pick_char" class="text_pole" style="width:100%;margin-top:8px">${options}</select>
+        <div class="zos_hint" style="margin-top:6px">加进来之后可以单独改昵称、头像和线上人设,不会动你的角色卡。</div>
+    </div>`;
+
+    const ok = await callGenericPopup(html, POPUP_TYPE.CONFIRM, '', { okButton: '加进来', cancelButton: '算了' });
+    if (!ok) return;
+
+    const avatarKey = String($('#zos_pick_char').val() || '');
+    const card = pool.find(c => c.avatar === avatarKey);
+    if (!card) return;
+
+    contacts.push({
+        id: uuidv4(),
+        avatarKey,
+        nick: card.name || '',
+        avatar: '',
+        persona: '',
+        messages: [],
+    });
+
+    await saveContacts();
+    renderScreen();
+}
+
+async function onSaveContact() {
+    const c = contactById(openChatId);
+    if (!c) return;
+
+    c.nick = String($('#zos_edit_nick').val() || '').trim();
+    c.persona = String($('#zos_edit_persona').val() || '');
+
+    await saveContacts();
+    goto('chat_room');
+}
+
+async function onDeleteContact() {
+    const c = contactById(openChatId);
+    if (!c) return;
+
+    const ok = await callGenericPopup(
+        `<div class="zos_popup">把「${escapeHtml(c.nick || '')}」从手机里删掉?<br>
+        <b>聊天记录也会一起没。</b>你的角色卡不受影响。</div>`,
+        POPUP_TYPE.CONFIRM, '', { okButton: '删', cancelButton: '算了' });
+
+    if (!ok) return;
+
+    contacts = contacts.filter(x => x.id !== c.id);
+    openChatId = null;
+
+    await saveContacts();
+    goto('chat_list');
+}
+
+/** 换头像:图也走酒馆那个文件接口,和联系人存在同一个地方 */
+async function onPickAvatar(file) {
+    const c = contactById(openChatId);
+    if (!c || !file) return;
+
+    try {
+        const buffer = await file.arrayBuffer();
+        let binary = '';
+        const bytes = new Uint8Array(buffer);
+        for (let i = 0; i < bytes.length; i += 0x8000) {
+            binary += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+        }
+
+        // 文件名带上联系人 id,换头像时会原地覆盖,不会越攒越多
+        const ext = (file.name.split('.').pop() || 'png').toLowerCase().replace(/[^a-z0-9]/g, '');
+        const path = await uploadFileAttachment(`zhimengos-avatar-${c.id}.${ext}`, btoa(binary));
+
+        if (!path) return;
+
+        // 带时间戳,不然换了图浏览器还拿旧的那张
+        c.avatar = `/${path}?t=${new Date().getTime()}`;
+        await saveContacts();
+        renderScreen();
+    } catch (error) {
+        console.error('[织梦OS] 换头像失败', error);
+    }
+}
+
+async function onResetAvatar() {
+    const c = contactById(openChatId);
+    if (!c) return;
+
+    c.avatar = '';
+    await saveContacts();
+    renderScreen();
+}
+
+async function openPhone() {
     buildPhone();
+    renderScreen();
+
+    // 每次开都重读一遍:这份数据是全局的,别的标签页可能改过
+    await loadContacts();
     renderScreen();
 
     $('#zos_phone_wrap').removeClass('zos_hidden');

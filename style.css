@@ -620,3 +620,153 @@
     opacity: 0.35;
     cursor: not-allowed;
 }
+
+/* ---------- 头像换成真图之后 ---------- */
+
+.zos_avatar img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    border-radius: inherit;
+}
+
+.zos_avatar_big {
+    width: 64px;
+    height: 64px;
+    border-radius: 18px;
+    font-size: 28px;
+}
+
+/* ---------- 空状态 ---------- */
+
+.zos_empty {
+    flex: 1 1 auto;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    padding: 24px;
+    text-align: center;
+    font-size: 12px;
+    color: var(--zos-ink-dim);
+    line-height: 1.6;
+}
+
+.zos_empty_big {
+    font-size: 14px;
+    color: var(--zos-ink);
+    opacity: 0.85;
+}
+
+/* ---------- 顶栏右边那个加号和省略号 ---------- */
+
+.zos_appbar_right {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.zos_add,
+.zos_more {
+    font-size: 22px;
+    line-height: 1;
+    cursor: pointer;
+    color: var(--zos-ink);
+    opacity: 0.85;
+}
+
+/* ---------- 联系人设置 ---------- */
+
+.zos_form {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.zos_form_avatar {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+
+.zos_form_hint {
+    font-size: 10px;
+    color: var(--zos-ink-dim);
+    margin-bottom: 4px;
+}
+
+.zos_upload {
+    display: inline-block;
+    padding: 4px 10px;
+    border-radius: 12px;
+    font-size: 11px;
+    cursor: pointer;
+    background-color: rgba(255, 255, 255, 0.12);
+}
+
+.zos_upload input {
+    display: none;
+}
+
+.zos_link {
+    margin-top: 5px;
+    font-size: 10px;
+    cursor: pointer;
+    color: #86b3f0;
+}
+
+.zos_form_row {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.zos_form_row > span {
+    font-size: 11px;
+    color: var(--zos-ink-dim);
+}
+
+.zos_form_row input,
+.zos_form_row textarea {
+    width: 100%;
+    padding: 7px 9px;
+    border-radius: 9px;
+    border: 1px solid var(--zos-line);
+    background-color: rgba(255, 255, 255, 0.06);
+    color: var(--zos-ink);
+    font-size: 12px;
+    font-family: inherit;
+    line-height: 1.5;
+    resize: vertical;
+}
+
+.zos_form_btns {
+    display: flex;
+    gap: 8px;
+    margin-top: 4px;
+}
+
+.zos_btn_main,
+.zos_btn_danger {
+    flex: 1 1 auto;
+    padding: 8px;
+    border-radius: 12px;
+    text-align: center;
+    font-size: 12px;
+    cursor: pointer;
+}
+
+.zos_btn_main {
+    background-color: var(--zos-blue);
+    color: #fff;
+}
+
+.zos_btn_danger {
+    background-color: rgba(229, 72, 77, 0.16);
+    color: #ff9a9d;
+}
