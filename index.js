@@ -21,7 +21,7 @@ import { writeSecret, SECRET_KEYS } from '../../../secrets.js';
 import { uuidv4 } from '../../../utils.js';
 
 /** 跟 manifest.json 的 version 手动保持一致,靠这行在控制台辨认在跑哪一版 */
-const VERSION = '0.7.0';
+const VERSION = '0.7.1';
 
 /** 必须和仓库名、文件夹名一致,理由见织梦者里那段注释 */
 const MODULE_NAME = 'zhimengos';
@@ -927,6 +927,17 @@ async function openPhone() {
     clockTimer = setInterval(() => $('#zos_clock').text(nowClock()), 20000);
 }
 
+function isPhoneOpen() {
+    const wrap = document.getElementById('zos_phone_wrap');
+    return Boolean(wrap) && !wrap.classList.contains('zos_hidden');
+}
+
+/** 再点一次悬浮球就收回去(2026-08-18 道长要的) */
+function togglePhone() {
+    if (isPhoneOpen()) closePhone();
+    else openPhone();
+}
+
 function closePhone() {
     $('#zos_phone_wrap').addClass('zos_hidden');
 
@@ -1043,7 +1054,7 @@ function buildBall() {
             return;
         }
 
-        openPhone();
+        togglePhone();
     });
 
     // 窗口大小变了要拉回可视范围,不然球会跑到屏幕外面再也点不着
@@ -1382,7 +1393,7 @@ function renderPanel() {
 
     $('#extensions_settings').append(html);
 
-    $('#zos_open').on('click', () => openPhone());
+    $('#zos_open').on('click', () => togglePhone());
 
     $('#zos_ball_hidden').on('input', function () {
         getSettings().ballHidden = Boolean($(this).prop('checked'));

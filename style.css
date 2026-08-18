@@ -182,6 +182,11 @@
     display: flex;
     align-items: center;
     justify-content: center;
+    /* 保险:万一尺寸算大了,让它能滚而不是把顶部吃掉。
+       flex 居中一旦溢出,溢出的那一半在上面,是滚不到的,所以必须配下面那句 margin auto。
+       (2026-08-18 iPad 上就是顶部被截断) */
+    overflow: auto;
+    padding: 6px 0;
 }
 
 #zos_backdrop {
@@ -193,6 +198,12 @@
 
 #zos_phone {
     position: relative;
+    flex: 0 0 auto;
+    /* 配合外层的 overflow:auto,溢出时上下都留得住,不会只被砍上半截 */
+    margin: auto;
+    /* 两行都要:dvh 老一点的 Safari 不认,不认时整条声明会被丢掉,尺寸就失控。
+       下面那条支持 dvh 时覆盖上面那条,不支持时自动落到 vh 这版。 */
+    width: min(94vw, calc(86vh * 9 / 16));
     width: min(94vw, calc(90dvh * 9 / 16));
     aspect-ratio: 9 / 16;
     padding: 10px;
