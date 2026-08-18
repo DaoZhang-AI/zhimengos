@@ -1,0 +1,932 @@
+/**
+ * 📱 织梦OS
+ *
+ * 模拟手机:在酒馆里和角色线上聊天。以后社交、直播都挂在这一部手机里。
+ * 织梦者(zhimengzhe)的子模块之一,但独立成扩展,单独装单独更。
+ *
+ * 顺序是道长定的(2026-08-18):**先做前端,再接数据**。
+ * 理由不是"想早点看到东西",而是**手机长什么样决定了数据怎么存**:
+ * 有几个会话、一条消息带哪些字段、联系人怎么表示,不看见屏幕就只能猜。
+ *
+ * 所以这一版是**能看能点的壳**,里面是示例数据,还不会真的发消息。
+ */
+
+import { extension_settings } from '../../../extensions.js';
+import { saveSettingsDebounced, getRequestHeaders } from '../../../../script.js';
+import { callGenericPopup, POPUP_TYPE } from '../../../popup.js';
+import { writeSecret, SECRET_KEYS } from '../../../secrets.js';
+import { uuidv4 } from '../../../utils.js';
+
+/** 跟 manifest.json 的 version 手动保持一致,靠这行在控制台辨认在跑哪一版 */
+const VERSION = '0.4.2';
+
+/** 必须和仓库名、文件夹名一致,理由见织梦者里那段注释 */
+const MODULE_NAME = 'zhimengos';
+
+/** 第三方扩展「API Config Manager」的地盘。探得到就顺带列出来,探不到当它不存在。 */
+const ACM_KEY = 'api-config-manager';
+
+/** 悬浮入口的两张图,道长自己出的。加载不到就退回画出来的那个,不会开天窗。
+ *  平时是黑屏那张,**有新消息时换成亮屏那张**,这是她定的提示方式。 */
+const BALL_DIR = '/scripts/extensions/third-party/zhimengos/assets';
+const BALL_IMAGE_IDLE = `${BALL_DIR}/phone.png`;
+const BALL_IMAGE_NEW = `${BALL_DIR}/phone-new.png`;
+/** 单独抠出来的铃铛,有新消息时叠在手机上摇 */
+const BALL_IMAGE_BELL = `${BALL_DIR}/bell.png`;
+
+const defaultSettings = {
+    /** 手机用哪条连接。形如 st:<id> 或 acm:<名字>,空字符串 = 跟主线用同一个 */
+    connId: '',
+    /** 每条连接各自的默认模型:{ [connId]: 模型名 } */
+    models: {},
+    /** 悬浮入口藏起来了没有。**屏幕上的常驻元素必须能关**,这是道长定的规矩 */
+    ballHidden: false,
+    /** 悬浮入口被拖到哪儿了:{ left, top },单位像素 */
+    ballPos: null,
+};
+
+function getSettings() {
+    if (!extension_settings[MODULE_NAME]) {
+        extension_settings[MODULE_NAME] = structuredClone(defaultSettings);
+    }
+
+    const settings = extension_settings[MODULE_NAME];
+    if (!settings.models || typeof settings.models !== 'object') settings.models = {};
+    return settings;
+}
+
+function escapeHtml(text) {
+    return String(text)
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#39;');
+}
+
+/* ==========================================================================
+ * 连接:借现成的,自己不存 key
+ *
+ * 由来(2026-08-17 道长):公益站大多不让脱离酒馆使用。而对话请求本来就是
+ * 酒馆服务端发出去的,所以只要走酒馆自己的通道,对面看到的**就是**酒馆在发,
+ * 不是"像"酒馆。浏览器直连则三个硬伤:key 暴露在前端、CORS 挡死、来源是浏览器。
+ *
+ * **自己绝不存 key**:①key 会进 settings.json,这插件要分发,
+ * 等于每个用户的 key 躺在一个会被备份、同步、截图的文件里;
+ * ②酒馆本来就有专门存密钥的地方,再造一个只是多一个泄漏面。
+ *
+ * 两个来源都列(2026-08-18 道长:"我所有的内容都是存在这里的,很少存在酒馆官方的"):
+ *   一、酒馆自带的「连接配置」connection-manager,人人都有
+ *   二、第三方扩展 API Config Manager,她自己在用,没装的人自动看不到这一组
+ * 我们只读它记录的**密钥 id**,不碰它明文存下来的那份 key。
+ * ========================================================================== */
+
+/** 连接管理器是酒馆自带扩展,但用户可以禁用它 */
+function isConnectionManagerAvailable() {
+    const disabled = extension_settings.disabledExtensions || [];
+    return !disabled.includes('connection-manager') && Boolean(extension_settings.connectionManager);
+}
+
+/**
+ * @typedef {object} Conn
+ * @property {string} id       st:<id> 或 acm:<名字>
+ * @property {string} name
+ * @property {string} group    下拉里的分组标题
+ * @property {string} url
+ * @property {string} secretId 酒馆密钥仓库里的 id
+ * @property {string} model    这条连接自带的模型名,当默认值用
+ * @property {string} blocked  不为空就是不能用,内容是原因
+ */
+
+/** @returns {Conn[]} 两个来源合到一起 */
+function listConnections() {
+    /** @type {Conn[]} */
+    const list = [];
+
+    if (isConnectionManagerAvailable()) {
+        const profiles = extension_settings.connectionManager?.profiles || [];
+
+        for (const p of profiles) {
+            // mode 是 cc 的才是对话补全,手机聊天只能用这种
+            if (!p?.id || p.mode !== 'cc') continue;
+
+            list.push({
+                id: `st:${p.id}`,
+                name: p.name || '(没名字)',
+                group: '酒馆自带的连接配置',
+                url: p['api-url'] || '',
+                secretId: p['secret-id'] || '',
+                model: p.model || '',
+                blocked: '',
+            });
+        }
+    }
+
+    const acm = extension_settings[ACM_KEY];
+    const acmConfigs = Array.isArray(acm?.configs) ? acm.configs : [];
+
+    for (const c of acmConfigs) {
+        if (!c?.name) continue;
+
+        const secretId = c.secretIds?.[SECRET_KEYS.CUSTOM] || '';
+
+        list.push({
+            id: `acm:${c.name}`,
+            name: c.name,
+            group: 'API 管理器里的配置',
+            url: c.customUrl || c.url || '',
+            secretId,
+            model: c.model || '',
+            // 没有密钥 id 就必须挡住。酒馆在 secret_id 为空时会**默默改用当前默认的那把 key**,
+            // 静默用错钥匙比明说不能用糟糕得多。
+            blocked: secretId ? '' : '这条没记下密钥 id,去 API 管理器里重新保存一次就能用',
+        });
+    }
+
+    return list;
+}
+
+/** @returns {Conn|null} */
+function findConnection(id) {
+    if (!id) return null;
+    return listConnections().find(c => c.id === id) || null;
+}
+
+/**
+ * 把用户填的那一条写进酒馆:密钥进酒馆的密钥仓库,地址进酒馆的连接配置。
+ * 我们这边一个字都不留。
+ *
+ * ⚠️ 酒馆的 createConnectionProfile 没有导出,而且它的做法是**把当前选中的连接
+ * 整个快照下来**(connection-manager/index.js:258),不是填表,所以调不了,
+ * 只能自己按它的字段结构拼一条。字段名抄自同文件的 FANCY_NAMES(:72)。
+ * **只拼最少的几个字段**,其余留空让酒馆用默认,字段越少,酒馆改结构时要跟的面越小。
+ *
+ * @returns {Promise<string|null>} 新配置的 id
+ */
+async function createProfile({ name, url, key, model }) {
+    // 先写密钥拿到 id 再拼配置。反过来的话密钥写失败会留下一条连不上的配置
+    const secretId = await writeSecret(SECRET_KEYS.CUSTOM, key, name);
+
+    if (!secretId) {
+        console.error('[织梦OS] 密钥没写进去');
+        return null;
+    }
+
+    const profile = {
+        id: uuidv4(),
+        mode: 'cc',
+        api: 'custom',
+        exclude: [],
+        name,
+        'api-url': url,
+        'secret-id': secretId,
+        model,
+    };
+
+    extension_settings.connectionManager.profiles.push(profile);
+    saveSettingsDebounced();
+
+    return `st:${profile.id}`;
+}
+
+/* ==========================================================================
+ * 模型清单
+ *
+ * 这不是探活。**拉模型列表是任何客户端连上去都会做的正常动作**,酒馆自己
+ * 每次切换连接也会拉一次;而"发一条假消息去试通不通"是造出来的探测请求,
+ * 会让公益站把用户拉黑(2026-08-18 道长明确否掉了测试按钮)。两者别混。
+ * ========================================================================== */
+
+/** @returns {Promise<string[]>} 模型名列表 */
+async function fetchModels(conn) {
+    const response = await fetch('/api/backends/chat-completions/status', {
+        method: 'POST',
+        headers: getRequestHeaders(),
+        cache: 'no-cache',
+        body: JSON.stringify({
+            chat_completion_source: 'custom',
+            custom_url: conn.url,
+            secret_id: conn.secretId,
+        }),
+    });
+
+    if (!response.ok) {
+        throw new Error(`${response.status} ${response.statusText}`);
+    }
+
+    const data = await response.json();
+
+    if (data?.error) {
+        throw new Error(typeof data.error === 'string' ? data.error : '对面返回了一个错误');
+    }
+
+    return (Array.isArray(data?.data) ? data.data : [])
+        .map(m => String(m?.id || m || '').trim())
+        .filter(Boolean)
+        .sort((a, b) => a.localeCompare(b));
+}
+
+/* ==========================================================================
+ * 手机壳
+ *
+ * 竖屏只写一次(2026-08-18 道长定):电脑版也保持竖屏。理由不只是省事,
+ * **直播的信息结构(画面 + 弹幕流 + 礼物)本来就是竖屏原生的**,
+ * 横屏得重排三栏,等于两套布局两套 bug。
+ *
+ * 宽度用 min(94vw, 90dvh * 9 / 16) 算,高度靠 aspect-ratio 推出来。
+ * 这样窄屏按宽度收、矮屏按高度收,两边都不会把比例压变形。
+ * ========================================================================== */
+
+/** 现在停在哪一屏:home / chat_list / chat_room */
+let screen = 'home';
+/** 打开的是哪个会话 */
+let openChatId = null;
+/** 状态栏时钟的定时器,关手机时要停掉 */
+let clockTimer = null;
+
+/** 主屏上的图标。done 为假的先摆着,点了只说还没做,别给个死链接 */
+const APPS = [
+    { id: 'chat', name: '聊天', icon: '💬', done: true },
+    { id: 'moments', name: '朋友圈', icon: '🌤️', done: false },
+    { id: 'weibo', name: '微博', icon: '📰', done: false },
+    { id: 'live', name: '直播', icon: '📺', done: false },
+    { id: 'contacts', name: '通讯录', icon: '👥', done: false },
+    { id: 'wallet', name: '钱包', icon: '💰', done: false },
+];
+
+/** 示例数据。**只是让形态看得见**,不是真数据,接上真数据时整块换掉。 */
+const SAMPLE_CHATS = [
+    {
+        id: 'demo1',
+        name: '（示例）某个角色',
+        avatar: '🌙',
+        last: '在忙吗',
+        time: '刚刚',
+        unread: 2,
+        messages: [
+            { from: 'them', text: '在忙吗', time: '21:03' },
+            { from: 'me', text: '刚回来', time: '21:05' },
+            { from: 'them', text: '那正好,我这边也刚结束', time: '21:05' },
+        ],
+    },
+    {
+        id: 'demo2',
+        name: '（示例）网名不认识的人',
+        avatar: '🎧',
+        last: '你也在这个群里?',
+        time: '昨天',
+        unread: 0,
+        messages: [
+            { from: 'them', text: '你也在这个群里?', time: '昨天 23:41' },
+        ],
+    },
+];
+
+function nowClock() {
+    const d = new Date();
+    return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+}
+
+function renderHome() {
+    const icons = APPS.map(app => `
+        <div class="zos_app ${app.done ? '' : 'zos_app_todo'}" data-app="${escapeHtml(app.id)}">
+            <div class="zos_app_icon">${app.icon}</div>
+            <div class="zos_app_name">${escapeHtml(app.name)}</div>
+        </div>`).join('');
+
+    return `
+        <div class="zos_home">
+            <div class="zos_home_grid">${icons}</div>
+            <div class="zos_home_note">灰的那些还没做。这一版是壳,聊天里是示例数据。</div>
+        </div>`;
+}
+
+function renderChatList() {
+    const rows = SAMPLE_CHATS.map(c => `
+        <div class="zos_chat_row" data-chat="${escapeHtml(c.id)}">
+            <div class="zos_avatar">${c.avatar}</div>
+            <div class="zos_chat_mid">
+                <div class="zos_chat_name">${escapeHtml(c.name)}</div>
+                <div class="zos_chat_last">${escapeHtml(c.last)}</div>
+            </div>
+            <div class="zos_chat_right">
+                <div class="zos_chat_time">${escapeHtml(c.time)}</div>
+                ${c.unread ? `<div class="zos_badge">${c.unread}</div>` : ''}
+            </div>
+        </div>`).join('');
+
+    return `
+        <div class="zos_appbar">
+            <div class="zos_back" data-to="home">‹</div>
+            <div class="zos_appbar_title">聊天</div>
+            <div class="zos_appbar_right"></div>
+        </div>
+        <div class="zos_list">${rows}</div>`;
+}
+
+function renderChatRoom() {
+    const chat = SAMPLE_CHATS.find(c => c.id === openChatId) || SAMPLE_CHATS[0];
+
+    const bubbles = chat.messages.map(m => `
+        <div class="zos_msg zos_msg_${m.from === 'me' ? 'me' : 'them'}">
+            <div class="zos_bubble">${escapeHtml(m.text)}</div>
+            <div class="zos_msg_time">${escapeHtml(m.time)}</div>
+        </div>`).join('');
+
+    return `
+        <div class="zos_appbar">
+            <div class="zos_back" data-to="chat_list">‹</div>
+            <div class="zos_appbar_title">${escapeHtml(chat.name)}</div>
+            <div class="zos_appbar_right"></div>
+        </div>
+        <div class="zos_msgs">${bubbles}</div>
+        <div class="zos_composer">
+            <input class="zos_input" type="text" placeholder="还没接上,先看形态" disabled>
+            <div class="zos_send zos_send_off">发送</div>
+        </div>`;
+}
+
+function renderScreen() {
+    let body = '';
+
+    if (screen === 'home') body = renderHome();
+    else if (screen === 'chat_list') body = renderChatList();
+    else if (screen === 'chat_room') body = renderChatRoom();
+
+    $('#zos_screen').html(body);
+    $('#zos_phone').attr('data-screen', screen);
+}
+
+function goto(next, chatId = null) {
+    screen = next;
+    if (chatId) openChatId = chatId;
+    renderScreen();
+}
+
+function buildPhone() {
+    if (document.getElementById('zos_phone_wrap')) return;
+
+    // 外面一圈白壳,里面一块黑屏,状态栏和刘海都在黑屏里面,照道长给的那张实物图来。
+    // **配色写死,不跟酒馆主题走**(2026-08-18 她的话:"不要跟随系统的美化,现在显得怪怪的")。
+    const html = `
+    <div id="zos_phone_wrap" class="zos_hidden">
+        <div id="zos_backdrop"></div>
+        <div id="zos_phone">
+            <div class="zos_btn zos_btn_mute"></div>
+            <div class="zos_btn zos_btn_up"></div>
+            <div class="zos_btn zos_btn_down"></div>
+            <div class="zos_btn zos_btn_power"></div>
+            <div class="zos_screen_area">
+                <div class="zos_notch">
+                    <span class="zos_speaker"></span>
+                    <span class="zos_cam"></span>
+                </div>
+                <div class="zos_statusbar">
+                    <div id="zos_clock">${nowClock()}</div>
+                    <div class="zos_status_right">
+                        <span class="zos_sig"></span><span class="zos_bat"></span>
+                    </div>
+                </div>
+                <div id="zos_screen"></div>
+                <div class="zos_homebar" title="回主屏"></div>
+            </div>
+        </div>
+    </div>`;
+
+    $('body').append(html);
+
+    // 点手机外面的暗底关掉。点手机本身不关,不然误触就没了
+    $('#zos_backdrop').on('click', () => closePhone());
+    $('.zos_homebar').on('click', () => goto('home'));
+
+    $('#zos_screen').on('click', '.zos_app', function () {
+        const app = String($(this).data('app'));
+        const meta = APPS.find(a => a.id === app);
+
+        if (!meta?.done) {
+            toastr.info(`「${meta?.name || app}」还没做`, '织梦OS');
+            return;
+        }
+
+        if (app === 'chat') goto('chat_list');
+    });
+
+    $('#zos_screen').on('click', '.zos_chat_row', function () {
+        goto('chat_room', String($(this).data('chat')));
+    });
+
+    $('#zos_screen').on('click', '.zos_back', function () {
+        goto(String($(this).data('to')));
+    });
+}
+
+function openPhone() {
+    buildPhone();
+    renderScreen();
+
+    $('#zos_phone_wrap').removeClass('zos_hidden');
+
+    // 时钟只在手机开着时走,关了就停,别让它常驻烧定时器
+    if (clockTimer) clearInterval(clockTimer);
+    clockTimer = setInterval(() => $('#zos_clock').text(nowClock()), 20000);
+}
+
+function closePhone() {
+    $('#zos_phone_wrap').addClass('zos_hidden');
+
+    if (clockTimer) {
+        clearInterval(clockTimer);
+        clockTimer = null;
+    }
+}
+
+/* ==========================================================================
+ * 悬浮入口
+ *
+ * **屏幕上的常驻元素必须能关**(2026-08-18 道长定的通用规矩):
+ * 所以设置里有开关,藏了之后从设置里还能放出来。
+ *
+ * 图标用道长自己画的透明底 png,放在 assets/phone.png。
+ * **加载不到就退回画出来的那个**,所以图没放也不会开天窗。
+ * ========================================================================== */
+
+/** 按下去到松开,移动没超过这个像素就算点击,不算拖动 */
+const DRAG_SLOP = 5;
+
+function clampToViewport(left, top, width, height) {
+    return {
+        left: Math.min(Math.max(left, 0), Math.max(window.innerWidth - width, 0)),
+        top: Math.min(Math.max(top, 0), Math.max(window.innerHeight - height, 0)),
+    };
+}
+
+function applyBallPosition() {
+    const ball = document.getElementById('zos_ball');
+    if (!ball) return;
+
+    const settings = getSettings();
+    const width = ball.offsetWidth || 38;
+    const height = ball.offsetHeight || 70;
+
+    // 没拖过就放右下角,别挡住输入框
+    const pos = settings.ballPos || {
+        left: window.innerWidth - width - 14,
+        top: window.innerHeight - height - 120,
+    };
+
+    const safe = clampToViewport(pos.left, pos.top, width, height);
+    ball.style.left = `${safe.left}px`;
+    ball.style.top = `${safe.top}px`;
+}
+
+function buildBall() {
+    if (document.getElementById('zos_ball')) return;
+
+    const html = `
+    <div id="zos_ball" title="织梦OS(可以拖)">
+        <img id="zos_ball_img" src="${BALL_IMAGE_IDLE}" alt="">
+        <div id="zos_ball_fallback" class="zos_hidden">
+            <div class="zos_ball_phone"><div class="zos_ball_screen"></div></div>
+        </div>
+        <img id="zos_ball_bell" src="${BALL_IMAGE_BELL}" class="zos_hidden" alt="">
+    </div>`;
+
+    $('body').append(html);
+
+    // 图没放进去就换成画出来的,不留一个破图标
+    document.getElementById('zos_ball_img').addEventListener('error', () => {
+        $('#zos_ball_img').addClass('zos_hidden');
+        $('#zos_ball_fallback').removeClass('zos_hidden');
+    });
+
+    // 铃铛还没抠出来的话,退回"整张换成亮屏那张"
+    document.getElementById('zos_ball_bell').addEventListener('error', () => {
+        bellReady = false;
+        $('#zos_ball_bell').addClass('zos_hidden');
+        if (unreadNow) document.getElementById('zos_ball_img').src = BALL_IMAGE_NEW;
+    });
+
+    const ball = document.getElementById('zos_ball');
+    let dragging = false;
+    let moved = false;
+    let offsetX = 0;
+    let offsetY = 0;
+
+    ball.addEventListener('pointerdown', (event) => {
+        dragging = true;
+        moved = false;
+        offsetX = event.clientX - ball.offsetLeft;
+        offsetY = event.clientY - ball.offsetTop;
+        ball.setPointerCapture(event.pointerId);
+    });
+
+    ball.addEventListener('pointermove', (event) => {
+        if (!dragging) return;
+
+        const left = event.clientX - offsetX;
+        const top = event.clientY - offsetY;
+
+        if (Math.abs(left - ball.offsetLeft) > DRAG_SLOP || Math.abs(top - ball.offsetTop) > DRAG_SLOP) {
+            moved = true;
+        }
+
+        const safe = clampToViewport(left, top, ball.offsetWidth, ball.offsetHeight);
+        ball.style.left = `${safe.left}px`;
+        ball.style.top = `${safe.top}px`;
+    });
+
+    ball.addEventListener('pointerup', (event) => {
+        if (!dragging) return;
+        dragging = false;
+        ball.releasePointerCapture(event.pointerId);
+
+        if (moved) {
+            // 拖完记住位置,下次开页面还在原地
+            getSettings().ballPos = { left: ball.offsetLeft, top: ball.offsetTop };
+            saveSettingsDebounced();
+            return;
+        }
+
+        openPhone();
+    });
+
+    // 窗口大小变了要拉回可视范围,不然球会跑到屏幕外面再也点不着
+    window.addEventListener('resize', () => applyBallPosition());
+
+    applyBallPosition();
+}
+
+function applyBall() {
+    const hidden = getSettings().ballHidden;
+
+    buildBall();
+    $('#zos_ball').toggleClass('zos_hidden', Boolean(hidden));
+}
+
+/** bell.png 在不在。加载失败一次就记着,别每次都重试 */
+let bellReady = true;
+/** 现在是不是有未读 */
+let unreadNow = false;
+
+/**
+ * 有没有新消息。有就在手机上叠一个铃铛,**一阵一阵地摇**。
+ *
+ * 为什么是摇不是闪(2026-08-18 道长):一闪一闪的东西挂在屏幕上几分钟就烦人,
+ * 而摇是一阵一阵的,响一下停两秒,读起来是"来消息了"而不是"有个东西在闪"。
+ * 想换成闪只要改 style.css 里 zos_shake 那段。
+ *
+ * **不要红点、不要辉光**,这两样她都明确不要。
+ *
+ * 现在只有设置里那个预览开关会调它;等真消息接上了,由收到消息的地方调。
+ * **不存进设置**:未读是运行时状态,存下来会出现"刷新之后还亮着但点进去什么都没有"。
+ *
+ * @param {boolean} unread
+ */
+function setBallUnread(unread) {
+    const img = document.getElementById('zos_ball_img');
+    if (!img) return;
+
+    unreadNow = Boolean(unread);
+
+    if (bellReady) {
+        // 铃铛在的话,底图一直是那台黑屏手机,只是上面多个铃铛
+        img.src = BALL_IMAGE_IDLE;
+        $('#zos_ball_bell').toggleClass('zos_hidden', !unreadNow);
+        return;
+    }
+
+    // 铃铛没抠出来,退回整张换图
+    img.src = unreadNow ? BALL_IMAGE_NEW : BALL_IMAGE_IDLE;
+}
+
+/* ==========================================================================
+ * 设置面板
+ * ========================================================================== */
+
+/** 选中的那条连接现在用哪个模型:自己设过就用自己的,没设过就用连接自带的 */
+function currentModelOf(conn) {
+    if (!conn) return '';
+    return getSettings().models[conn.id] || conn.model || '';
+}
+
+function renderConnectionOptions() {
+    const settings = getSettings();
+    const conns = listConnections();
+
+    // 选中的那条被删了或者改了名就退回主线,别留一个指向空气的 id
+    if (settings.connId && !conns.some(c => c.id === settings.connId)) {
+        settings.connId = '';
+        saveSettingsDebounced();
+    }
+
+    const groups = new Map();
+    for (const c of conns) {
+        if (!groups.has(c.group)) groups.set(c.group, []);
+        groups.get(c.group).push(c);
+    }
+
+    const parts = [`<option value="" ${settings.connId ? '' : 'selected'}>跟主线用同一个连接</option>`];
+
+    for (const [group, items] of groups) {
+        parts.push(`<optgroup label="${escapeHtml(group)}">`);
+        for (const c of items) {
+            const selected = c.id === settings.connId ? 'selected' : '';
+            const mark = c.blocked ? ' (不能用)' : '';
+            parts.push(`<option value="${escapeHtml(c.id)}" ${selected}>${escapeHtml(c.name)}${mark}</option>`);
+        }
+        parts.push('</optgroup>');
+    }
+
+    $('#zos_conn').html(parts.join(''));
+    renderConnectionDetail();
+}
+
+/** 选中一条之后下面那块:地址、模型、以及不能用时的原因 */
+function renderConnectionDetail() {
+    const conn = findConnection(getSettings().connId);
+
+    if (!conn) {
+        $('#zos_conn_detail').html('<div class="zos_hint">手机会跟主线用同一个连接和模型。</div>');
+        $('#zos_model_row').hide();
+        return;
+    }
+
+    if (conn.blocked) {
+        $('#zos_conn_detail').html(`<div class="zos_hint zos_bad">${escapeHtml(conn.blocked)}</div>`);
+        $('#zos_model_row').hide();
+        return;
+    }
+
+    const model = currentModelOf(conn);
+
+    $('#zos_conn_detail').html(
+        `<div class="zos_hint">地址:${escapeHtml(conn.url || '(没填)')}</div>` +
+        `<div class="zos_hint">当前模型:<b>${escapeHtml(model || '还没选')}</b></div>`);
+
+    $('#zos_model_row').show();
+
+    // 每换一条连接就把模型下拉清空,免得把上一条的模型看成这一条的
+    $('#zos_model').html(`<option value="">${model ? escapeHtml(model) : '还没加载'}</option>`).val('');
+}
+
+async function onLoadModels() {
+    const conn = findConnection(getSettings().connId);
+    if (!conn || conn.blocked) return;
+
+    const $button = $('#zos_load_models');
+    $button.text('加载中...');
+
+    try {
+        const models = await fetchModels(conn);
+
+        if (!models.length) {
+            await callGenericPopup(
+                '<div class="zos_popup">对面没返回任何模型。有的站点不提供模型列表,那就自己在下面手填一个。</div>',
+                POPUP_TYPE.TEXT, '', { okButton: '知道了' });
+            return;
+        }
+
+        const current = currentModelOf(conn);
+        const options = models.map(m =>
+            `<option value="${escapeHtml(m)}" ${m === current ? 'selected' : ''}>${escapeHtml(m)}</option>`);
+
+        $('#zos_model').html(options.join(''))
+            .val(current && models.includes(current) ? current : models[0])
+            .trigger('change');
+
+        $('#zos_model_count').text(`拉到 ${models.length} 个模型`);
+    } catch (error) {
+        await callGenericPopup(
+            `<div class="zos_popup"><div class="zos_bad">拉不到模型列表。</div>
+            <div class="zos_hint">酒馆的原话:</div>
+            <div class="zos_reason">${escapeHtml(String(error?.message || error))}</div>
+            <div class="zos_hint">有的站点本来就不给模型列表,这不代表这条连接不能用,自己手填模型名即可。</div></div>`,
+            POPUP_TYPE.TEXT, '', { okButton: '知道了', wide: true });
+    } finally {
+        $button.text('加载模型');
+    }
+}
+
+function onPickModel() {
+    const settings = getSettings();
+    const conn = findConnection(settings.connId);
+    const model = String($('#zos_model').val() || '').trim();
+
+    if (!conn || !model) return;
+
+    settings.models[conn.id] = model;
+    saveSettingsDebounced();
+    renderConnectionDetail();
+}
+
+function onTypeModel() {
+    const settings = getSettings();
+    const conn = findConnection(settings.connId);
+    const model = String($('#zos_model_manual').val() || '').trim();
+
+    if (!conn) return;
+
+    if (!model) {
+        delete settings.models[conn.id];
+    } else {
+        settings.models[conn.id] = model;
+    }
+
+    saveSettingsDebounced();
+    $('#zos_model_manual').val('');
+    renderConnectionDetail();
+}
+
+async function onAddProfile() {
+    const name = String($('#zos_new_name').val() || '').trim();
+    const url = String($('#zos_new_url').val() || '').trim();
+    const key = String($('#zos_new_key').val() || '').trim();
+    const model = String($('#zos_new_model').val() || '').trim();
+
+    if (!name || !url || !key) {
+        await callGenericPopup(
+            '<div class="zos_popup">名字、接口地址、密钥这三样都要填。</div>',
+            POPUP_TYPE.TEXT, '', { okButton: '知道了' });
+        return;
+    }
+
+    if (!/^https?:\/\//i.test(url)) {
+        await callGenericPopup(
+            '<div class="zos_popup">接口地址要以 http:// 或者 https:// 开头。</div>',
+            POPUP_TYPE.TEXT, '', { okButton: '知道了' });
+        return;
+    }
+
+    if (!isConnectionManagerAvailable()) {
+        await callGenericPopup(
+            '<div class="zos_popup">酒馆自带的「连接管理器」被禁用了,加不了连接。<br>去扩展面板把 connection-manager 打开再来。</div>',
+            POPUP_TYPE.TEXT, '', { okButton: '知道了' });
+        return;
+    }
+
+    const $button = $('#zos_add_profile');
+    $button.text('加进去...');
+
+    try {
+        const id = await createProfile({ name, url, key, model });
+
+        if (!id) {
+            await callGenericPopup(
+                '<div class="zos_popup"><div class="zos_bad">没加成功。</div>密钥没能写进酒馆,所以地址和密钥都没有被保存。</div>',
+                POPUP_TYPE.TEXT, '', { okButton: '知道了' });
+            return;
+        }
+
+        getSettings().connId = id;
+        saveSettingsDebounced();
+
+        // 填完立刻清空,尤其密钥那格,别让它留在页面上
+        $('#zos_new_name, #zos_new_url, #zos_new_key, #zos_new_model').val('');
+
+        renderConnectionOptions();
+
+        await callGenericPopup(
+            `<div class="zos_popup">加好了,手机已经切到「${escapeHtml(name)}」。
+            <br>这条连接<b>存在酒馆自己那儿</b>,在酒馆的连接配置界面里也看得到、能改、能删。
+            <br>模型没填的话,现在可以点「加载模型」挑一个。</div>`,
+            POPUP_TYPE.TEXT, '', { okButton: '好' });
+    } finally {
+        $button.text('加进酒馆');
+    }
+}
+
+function renderPanel() {
+    const settings = getSettings();
+
+    const html = `
+    <div id="zos_settings">
+        <div class="inline-drawer">
+            <div class="inline-drawer-toggle inline-drawer-header">
+                <b>📱 织梦OS</b>
+                <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+            </div>
+            <div class="inline-drawer-content">
+
+                <b>入口</b>
+                <div class="zos_buttons">
+                    <div id="zos_open" class="menu_button">打开手机</div>
+                </div>
+                <label class="checkbox_label">
+                    <input id="zos_ball_hidden" type="checkbox" ${settings.ballHidden ? 'checked' : ''}>
+                    <span>把悬浮的手机图标藏起来</span>
+                </label>
+                <label class="checkbox_label">
+                    <input id="zos_ball_preview" type="checkbox">
+                    <span>预览「有新消息」的样子</span>
+                </label>
+                <div class="zos_hint">图标可以拖,位置会记住。藏起来之后用上面那个按钮照样能开。
+                    两张图分别是 <code>assets/phone.png</code>(平时)和 <code>assets/phone-new.png</code>(有新消息),
+                    想换自己替掉就行,文件不在会退回画出来的图标加一个小红点。
+                    <b>预览那个开关只是给你看效果的</b>,真消息接上之后会自动切。</div>
+
+                <hr>
+                <b>手机用哪个连接</b>
+                <div class="zos_hint">手机可以用和主线不同的模型,回一条消息不需要好模型,便宜的就够。
+                    下面列的是<b>你已经有的连接</b>,酒馆自带的和 API 管理器里的都在,分组显示。
+                    改名或删掉之后这里跟着变。</div>
+                <select id="zos_conn" class="text_pole"></select>
+                <div id="zos_conn_detail"></div>
+
+                <div id="zos_model_row">
+                    <div class="zos_field">
+                        <span>模型</span>
+                        <select id="zos_model" class="text_pole"></select>
+                    </div>
+                    <div class="zos_buttons">
+                        <div id="zos_load_models" class="menu_button">加载模型</div>
+                    </div>
+                    <div id="zos_model_count" class="zos_hint"></div>
+                    <div class="zos_hint">拉模型列表是正常的连接动作,不是探活。
+                        有的站点不给列表,那就在下面手填。</div>
+                    <label class="zos_field">
+                        <span>手填模型名(填完按回车)</span>
+                        <input id="zos_model_manual" type="text" class="text_pole" placeholder="留空并回车 = 恢复用这条连接自带的模型">
+                    </label>
+                </div>
+
+                <hr>
+                <b>加一条新连接</b>
+                <div class="zos_hint">不想去别处来回切的话,在这里填也一样。
+                    <b>填完是存进酒馆的</b>:密钥进酒馆的密钥仓库,地址进酒馆的连接配置,本插件一个字都不留。</div>
+
+                <label class="zos_field">
+                    <span>起个名字</span>
+                    <input id="zos_new_name" type="text" class="text_pole" placeholder="比如:手机专用">
+                </label>
+
+                <label class="zos_field">
+                    <span>接口地址</span>
+                    <input id="zos_new_url" type="text" class="text_pole" placeholder="https://例子.com/v1">
+                </label>
+
+                <label class="zos_field">
+                    <span>密钥</span>
+                    <input id="zos_new_key" type="password" class="text_pole" autocomplete="off" placeholder="sk-...">
+                </label>
+
+                <label class="zos_field">
+                    <span>模型名(可以先空着)</span>
+                    <input id="zos_new_model" type="text" class="text_pole" placeholder="留空的话加完再点「加载模型」挑">
+                </label>
+
+                <div class="zos_buttons">
+                    <div id="zos_add_profile" class="menu_button">加进酒馆</div>
+                </div>
+
+                <div class="zos_hint zos_bad">这里<b>不做连通性测试</b>。
+                    探测性的请求会让公益站把你拉黑,所以能不能用请你自己判断。</div>
+            </div>
+        </div>
+    </div>`;
+
+    $('#extensions_settings').append(html);
+
+    $('#zos_open').on('click', () => openPhone());
+
+    $('#zos_ball_hidden').on('input', function () {
+        getSettings().ballHidden = Boolean($(this).prop('checked'));
+        saveSettingsDebounced();
+        applyBall();
+    });
+
+    $('#zos_ball_preview').on('input', function () {
+        setBallUnread(Boolean($(this).prop('checked')));
+    });
+
+    $('#zos_conn').on('change', function () {
+        getSettings().connId = String($(this).val() || '');
+        saveSettingsDebounced();
+        renderConnectionDetail();
+        $('#zos_model_count').text('');
+    });
+
+    $('#zos_model').on('change', () => onPickModel());
+    $('#zos_load_models').on('click', () => onLoadModels());
+    $('#zos_add_profile').on('click', () => onAddProfile());
+
+    $('#zos_model_manual').on('keydown', function (event) {
+        if (event.key === 'Enter') {
+            event.preventDefault();
+            onTypeModel();
+        }
+    });
+
+    renderConnectionOptions();
+}
+
+jQuery(async () => {
+    getSettings();
+    renderPanel();
+    applyBall();
+
+    if (!isConnectionManagerAvailable()) {
+        console.warn('[织梦OS] 酒馆自带的连接管理器不可用,只能用 API 管理器里的配置或者跟主线走');
+    }
+
+    console.log(`[织梦OS] v${VERSION} 已加载。可用连接 ${listConnections().length} 条`);
+});

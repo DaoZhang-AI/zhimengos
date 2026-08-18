@@ -1,0 +1,11 @@
+{
+    "display_name": "📱 织梦OS",
+    "loading_order": 101,
+    "requires": [],
+    "optional": [],
+    "js": "index.js?v=0.4.2",
+    "css": "style.css?v=0.4.2",
+    "author": "@不如就叫我道长吧",
+    "version": "0.4.2",
+    "homePage": ""
+}
