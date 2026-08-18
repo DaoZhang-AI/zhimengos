@@ -11,7 +11,8 @@
  * 所以这一版是**能看能点的壳**,里面是示例数据,还不会真的发消息。
  */
 
-import { extension_settings } from '../../../extensions.js';
+import { extension_settings, writeExtensionField } from '../../../extensions.js';
+import { getContext } from '../../../st-context.js';
 import { saveSettingsDebounced, getRequestHeaders, characters, getThumbnailUrl, chat_metadata, saveMetadata } from '../../../../script.js';
 import { eventSource, event_types } from '../../../events.js';
 import { uploadFileAttachment } from '../../../chats.js';
@@ -20,7 +21,7 @@ import { writeSecret, SECRET_KEYS } from '../../../secrets.js';
 import { uuidv4 } from '../../../utils.js';
 
 /** 跟 manifest.json 的 version 手动保持一致,靠这行在控制台辨认在跑哪一版 */
-const VERSION = '0.6.0';
+const VERSION = '0.7.0';
 
 /** 必须和仓库名、文件夹名一致,理由见织梦者里那段注释 */
 const MODULE_NAME = 'zhimengos';
@@ -385,6 +386,34 @@ async function saveWhere(id) {
     else await saveLocal();
 }
 
+/* ---------- 卡里那一份:创作者烤进去的,发卡时跟着走 ----------
+ *
+ * 存在角色卡的 data.extensions.zhimengos,那是角色卡规范里给扩展留的位置,
+ * 导出 png 或 json 时会跟着走(写入用 public/scripts/extensions.js:2061 的
+ * writeExtensionField)。
+ *
+ * **和"存在聊天里"是两码事**,道长在这儿绕过一次:
+ *   聊天  = data/<用户>/chats/... 只在自己机器上,跟着这一局走
+ *   角色卡 = 那个 png/json 文件本身,是发给别人的东西
+ * 所以创作者要让手机内容跟着卡走,必须显式写进卡,不是存在聊天里就自动有了。
+ */
+
+/** 当前打开的是哪张角色卡。没开卡或者开的是群聊时返回 null */
+function currentCard() {
+    const context = getContext();
+    const id = context.characterId;
+
+    if (id === undefined || id === null || id === '') return null;
+    return { id, card: characters[id] || null };
+}
+
+/** @returns {Contact[]} 当前这张卡自带的联系人 */
+function cardContacts() {
+    const here = currentCard();
+    const data = here?.card?.data?.extensions?.[META_KEY];
+    return Array.isArray(data?.contacts) ? data.contacts : [];
+}
+
 /** 头像:自己设过就用自己的,没设过就借角色卡的 */
 function avatarOf(contact) {
     if (contact.avatar) return contact.avatar;
@@ -522,6 +551,13 @@ function renderContactEdit() {
                 <div id="zos_edit_move" class="zos_btn_ghost">${c.global ? '收回到这个聊天' : '挪到常驻'}</div>
             </div>
 
+            <div class="zos_form_row">
+                <span>发给别人</span>
+                <div class="zos_form_hint">上面两种都<b>只在你自己机器上</b>。
+                    要让别人拿到卡就自带这个人,得把他写进角色卡文件本身。</div>
+                <div id="zos_edit_tocard" class="zos_btn_ghost">写进角色卡</div>
+            </div>
+
             <div class="zos_form_btns">
                 <div id="zos_edit_save" class="zos_btn_main">保存</div>
                 <div id="zos_edit_del" class="zos_btn_danger">删掉这个联系人</div>
@@ -609,6 +645,7 @@ function buildPhone() {
     $('#zos_screen').on('click', '#zos_edit_del', () => onDeleteContact());
     $('#zos_screen').on('click', '#zos_avatar_reset', () => onResetAvatar());
     $('#zos_screen').on('click', '#zos_edit_move', () => onMoveContact());
+    $('#zos_screen').on('click', '#zos_edit_tocard', () => onWriteToCard());
     $('#zos_screen').on('change', '#zos_avatar_file', function () {
         onPickAvatar(this.files?.[0]);
     });
@@ -736,6 +773,105 @@ async function onMoveContact() {
     renderScreen();
 }
 
+/**
+ * 把这个联系人写进当前角色卡,发卡时跟着走。
+ *
+ * ⚠️ 这是**唯一一个会改动用户角色卡文件的动作**,所以必须问过再写,
+ * 而且要说清写的是哪张卡。
+ */
+async function onWriteToCard() {
+    const c = contactById(openChatId);
+    const here = currentCard();
+
+    if (!c) return;
+
+    if (!here?.card) {
+        await callGenericPopup(
+            '<div class="zos_popup">现在没有打开任何角色卡,写不进去。<br>群聊也不行,得先进一张卡的对话。</div>',
+            POPUP_TYPE.TEXT, '', { okButton: '知道了' });
+        return;
+    }
+
+    const count = c.messages?.length || 0;
+
+    const html = `<div class="zos_popup">
+        把「${escapeHtml(c.nick || '')}」写进角色卡<b>${escapeHtml(here.card.name || '')}</b>?
+        <div class="zos_hint" style="margin-top:6px"><b>这会改动你的角色卡文件。</b>
+        写进去之后,别人拿到这张卡就自带这个联系人。</div>
+        <label class="checkbox_label" style="margin-top:8px">
+            <input id="zos_with_msgs" type="checkbox" ${count ? 'checked' : ''} ${count ? '' : 'disabled'}>
+            <span>连聊天记录一起写(现在有 ${count} 条)</span>
+        </label>
+        <div class="zos_hint">带上记录的话,玩家一开局手机里就已经聊过这些。卡也会大一点。</div>
+    </div>`;
+
+    const ok = await callGenericPopup(html, POPUP_TYPE.CONFIRM, '', { okButton: '写进去', cancelButton: '算了' });
+    if (!ok) return;
+
+    const withMessages = Boolean($('#zos_with_msgs').prop('checked'));
+
+    const existing = cardContacts().filter(x => x.id !== c.id);
+    const payload = {
+        id: c.id,
+        avatarKey: c.avatarKey,
+        nick: c.nick,
+        // 头像不写进去:它是本机文件的地址,发到别人那儿就是死链接,让它退回用卡自己的头像
+        avatar: '',
+        persona: c.persona,
+        messages: withMessages ? (c.messages || []) : [],
+    };
+
+    await writeExtensionField(here.id, META_KEY, { version: 1, contacts: [...existing, payload] });
+
+    // 顺手把说明文字给创作者,免得她自己想怎么写(2026-08-18 道长提的)
+    const notice = `本卡自带「织梦OS」手机数据,需要先安装织梦OS 插件才能看到:
+https://github.com/DaoZhang-AI/zhimengos
+没装的话不影响正常聊天,只是手机里那部分内容不会出现。`;
+
+    await callGenericPopup(
+        `<div class="zos_popup">写进去了。<br>
+        <div class="zos_hint" style="margin-top:6px">建议把下面这段贴到卡的说明里,不然玩家不知道要装插件:</div>
+        <div class="zos_reason">${escapeHtml(notice)}</div></div>`,
+        POPUP_TYPE.TEXT, '', { okButton: '好', wide: true });
+}
+
+/**
+ * 这张卡自带联系人、而这个聊天还没导入过的话,问一句。
+ *
+ * **不自动导入**:自动的话等于任何一张卡都能往玩家手机里塞东西,
+ * 而且玩家会搞不清这个人是哪来的。问一句更贵一点,但边界清楚。
+ */
+async function offerCardImport() {
+    const fromCard = cardContacts();
+    if (!fromCard.length) return;
+
+    // 问过一次就记下来,别每次开手机都弹
+    if (chat_metadata?.[META_KEY]?.cardAsked) return;
+
+    const names = fromCard.map(c => c.nick || '(没名字)').join('、');
+
+    const ok = await callGenericPopup(
+        `<div class="zos_popup">这张角色卡自带手机联系人:<b>${escapeHtml(names)}</b>
+        <div class="zos_hint" style="margin-top:6px">要不要加进这个聊天的手机里?
+        加进来之后就是你自己的了,改昵称改设定都不会动到卡。</div></div>`,
+        POPUP_TYPE.CONFIRM, '', { okButton: '加进来', cancelButton: '这次不用' });
+
+    if (!chat_metadata[META_KEY]) chat_metadata[META_KEY] = {};
+    chat_metadata[META_KEY].cardAsked = true;
+
+    if (ok) {
+        const taken = new Set(allContacts().map(x => x.avatarKey));
+        for (const c of fromCard) {
+            if (taken.has(c.avatarKey)) continue;
+            // 换个 id,免得和卡里那份共用一个身份,以后各改各的
+            localContacts.push({ ...c, id: uuidv4() });
+        }
+    }
+
+    await saveLocal();
+    renderScreen();
+}
+
 /** 换头像:图也走酒馆那个文件接口,和联系人存在同一个地方 */
 async function onPickAvatar(file) {
     const c = contactById(openChatId);
@@ -781,6 +917,8 @@ async function openPhone() {
     loadLocal();
     await loadGlobal();
     renderScreen();
+
+    await offerCardImport();
 
     $('#zos_phone_wrap').removeClass('zos_hidden');
 
