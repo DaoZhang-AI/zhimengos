@@ -18,7 +18,7 @@ import { writeSecret, SECRET_KEYS } from '../../../secrets.js';
 import { uuidv4 } from '../../../utils.js';
 
 /** 跟 manifest.json 的 version 手动保持一致,靠这行在控制台辨认在跑哪一版 */
-const VERSION = '0.4.2';
+const VERSION = '0.4.3';
 
 /** 必须和仓库名、文件夹名一致,理由见织梦者里那段注释 */
 const MODULE_NAME = 'zhimengos';
@@ -589,8 +589,8 @@ function setBallUnread(unread) {
     unreadNow = Boolean(unread);
 
     if (bellReady) {
-        // 铃铛在的话,底图一直是那台黑屏手机,只是上面多个铃铛
-        img.src = BALL_IMAGE_IDLE;
+        // 有新消息:底图换成亮屏那张,铃铛叠上去摇(2026-08-18 道长:"phone new 加铃铛")
+        img.src = unreadNow ? BALL_IMAGE_NEW : BALL_IMAGE_IDLE;
         $('#zos_ball_bell').toggleClass('zos_hidden', !unreadNow);
         return;
     }
