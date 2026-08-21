@@ -20,14 +20,14 @@ import { ConnectionManagerRequestService } from '../../shared.js';
 // ⚠️ 这两个 import 后面的 ?v= 要跟着版本号一起改。
 // manifest 里的 ?v= 只管 index.js,管不到它 import 进来的文件,
 // 不带的话改了库文件浏览器还喂旧的那份。
-import { fuzzyAgo, fuzzyRange, displayTime } from './lib/fuzzy-time.js?v=0.10.1';
-import { maintain, buildMemoryText, describe, DEFAULTS as MEM_DEFAULTS } from './lib/rolling-summary.js?v=0.10.1';
+import { fuzzyAgo, fuzzyRange, displayTime } from './lib/fuzzy-time.js?v=0.11.0';
+import { maintain, buildMemoryText, describe, DEFAULTS as MEM_DEFAULTS } from './lib/rolling-summary.js?v=0.11.0';
 import { callGenericPopup, POPUP_TYPE } from '../../../popup.js';
 import { writeSecret, SECRET_KEYS } from '../../../secrets.js';
 import { uuidv4 } from '../../../utils.js';
 
 /** 跟 manifest.json 的 version 手动保持一致,靠这行在控制台辨认在跑哪一版 */
-const VERSION = '0.10.1';
+const VERSION = '0.11.0';
 
 /** 必须和仓库名、文件夹名一致,理由见织梦者里那段注释 */
 const MODULE_NAME = 'zhimengos';
@@ -61,6 +61,10 @@ const defaultSettings = {
     phonePos: null,
     /** 分层摘要的三个数字,含义见 lib/rolling-summary.js */
     memory: { ...MEM_DEFAULTS },
+    /** 写摘要用哪条连接。空 = 和聊天用同一条。
+     *  单独一条的理由(2026-08-21 道长):**有人聊天爱用 flash,聊天还行,写摘要爱瞎写。**
+     *  聊天要的是语感,摘要要的是老实,这两件事本来就该允许用不同的模型。 */
+    summaryConnId: '',
 };
 
 function getSettings() {
@@ -1418,15 +1422,17 @@ function buildPrompt(contact) {
  * @param {Array<{role: string, content: string}>} messages
  * @returns {Promise<string>}
  */
-async function runGeneration(messages, maxTokens = MAX_REPLY_TOKENS) {
+async function runGeneration(messages, maxTokens = MAX_REPLY_TOKENS, connId = null) {
     const settings = getSettings();
-    const conn = findConnection(settings.connId);
+    // 不传就用聊天那条。摘要会传自己那条进来
+    const useId = connId === null ? settings.connId : connId;
+    const conn = findConnection(useId);
     const model = conn ? currentModelOf(conn) : '';
 
     // 没选就用酒馆当前选中的那条,再没有就只能让她自己去挑
-    const profileId = settings.connId.startsWith('st:')
-        ? settings.connId.slice(3)
-        : (settings.connId ? '' : extension_settings.connectionManager?.selectedProfile || '');
+    const profileId = useId.startsWith('st:')
+        ? useId.slice(3)
+        : (useId ? '' : extension_settings.connectionManager?.selectedProfile || '');
 
     if (profileId) {
         const result = await ConnectionManagerRequestService.sendRequest(
@@ -1439,7 +1445,7 @@ async function runGeneration(messages, maxTokens = MAX_REPLY_TOKENS) {
         return String(result?.content || '').trim();
     }
 
-    if (conn && settings.connId.startsWith('acm:')) {
+    if (conn && useId.startsWith('acm:')) {
         if (conn.blocked) throw new Error(conn.blocked);
 
         const result = await getContext().ChatCompletionService.processRequest({
@@ -1529,9 +1535,13 @@ async function onSend() {
 async function runMaintain(contact) {
     const settings = getSettings();
 
+    // 摘要走自己那条连接。空的话 summaryConnId 是 '',而 runGeneration 的第三个参数
+    // 传 null 才表示"用聊天那条",所以这里要显式换算一下
+    const summaryConn = settings.summaryConnId || null;
+
     const result = await maintain(
         contact,
-        prompt => runGeneration([{ role: 'user', content: prompt }], 600),
+        prompt => runGeneration([{ role: 'user', content: prompt }], 600, summaryConn),
         { ...settings.memory, meName: '我', themName: contact.nick || '对方' });
 
     if (result.error) {
@@ -1677,7 +1687,38 @@ function renderConnectionOptions() {
     }
 
     $('#zos_conn').html(parts.join(''));
+    renderSummaryConnOptions(conns);
     renderConnectionDetail();
+}
+
+/** 摘要那条下拉。选项和聊天那条一样,只是头一项换成"和聊天用同一个" */
+function renderSummaryConnOptions(conns) {
+    const settings = getSettings();
+
+    if (settings.summaryConnId && !conns.some(c => c.id === settings.summaryConnId)) {
+        settings.summaryConnId = '';
+        saveSettingsDebounced();
+    }
+
+    const groups = new Map();
+    for (const c of conns) {
+        if (!groups.has(c.group)) groups.set(c.group, []);
+        groups.get(c.group).push(c);
+    }
+
+    const parts = [`<option value="" ${settings.summaryConnId ? '' : 'selected'}>和聊天用同一个</option>`];
+
+    for (const [group, items] of groups) {
+        parts.push(`<optgroup label="${escapeHtml(group)}">`);
+        for (const c of items) {
+            const selected = c.id === settings.summaryConnId ? 'selected' : '';
+            const mark = c.blocked ? ' (不能用)' : '';
+            parts.push(`<option value="${escapeHtml(c.id)}" ${selected}>${escapeHtml(c.name)}${mark}</option>`);
+        }
+        parts.push('</optgroup>');
+    }
+
+    $('#zos_sum_conn').html(parts.join(''));
 }
 
 /** 选中一条之后下面那块:地址、模型、以及不能用时的原因 */
@@ -1916,6 +1957,14 @@ function renderPanel() {
                     <input id="zos_compact_after" type="number" min="3" max="40" class="text_pole" value="${settings.memory.compactAfter}">
                 </label>
 
+                <label class="zos_field">
+                    <span>写摘要用哪个连接</span>
+                    <select id="zos_sum_conn" class="text_pole"></select>
+                </label>
+                <div class="zos_hint">可以和聊天用不同的模型。<b>聊天要的是语感,摘要要的是老实</b>,
+                    有些模型聊天挺好但写摘要爱瞎编,那就在这儿单独换一个。
+                    模型跟着连接走,在上面那条连接里选过的模型这里照样生效。</div>
+
                 <div class="zos_hint">摘要写歪了可以自己改:进某个联系人的设置,那里能看能改能删。</div>
 
                 <hr>
@@ -1987,6 +2036,11 @@ function renderPanel() {
         saveSettingsDebounced();
         renderConnectionDetail();
         $('#zos_model_count').text('');
+    });
+
+    $('#zos_sum_conn').on('change', function () {
+        getSettings().summaryConnId = String($(this).val() || '');
+        saveSettingsDebounced();
     });
 
     $('#zos_model').on('change', () => onPickModel());
