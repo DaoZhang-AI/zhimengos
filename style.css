@@ -833,3 +833,49 @@
     border: 1px solid var(--zos-line);
     background-color: rgba(255, 255, 255, 0.05);
 }
+
+/* 等回复时那句"正在输入" */
+.zos_typing {
+    align-self: flex-start;
+    padding: 7px 11px;
+    border-radius: 14px;
+    font-size: 12px;
+    background-color: rgba(255, 255, 255, 0.09);
+    color: var(--zos-ink-dim);
+}
+
+/* 联系人设置里的摘要,可以看可以改 */
+.zos_sum {
+    margin: 6px 0;
+    padding: 7px;
+    border-radius: 9px;
+    border: 1px solid var(--zos-line);
+    background-color: rgba(255, 255, 255, 0.04);
+}
+
+.zos_sum_head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 10px;
+    color: var(--zos-ink-dim);
+    margin-bottom: 4px;
+}
+
+.zos_sum_del {
+    cursor: pointer;
+    color: #ff9a9d;
+}
+
+.zos_sum_text {
+    width: 100%;
+    padding: 6px 8px;
+    border-radius: 7px;
+    border: 1px solid var(--zos-line);
+    background-color: rgba(255, 255, 255, 0.05);
+    color: var(--zos-ink);
+    font-size: 12px;
+    font-family: inherit;
+    line-height: 1.5;
+    resize: vertical;
+}
