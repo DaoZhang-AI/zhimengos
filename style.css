@@ -879,3 +879,20 @@
     line-height: 1.5;
     resize: vertical;
 }
+
+/* 一次回几条那一行,两个数字挤在一行里 */
+#zos_settings .zos_range {
+    flex-direction: row;
+    align-items: center;
+    gap: 6px;
+}
+
+#zos_settings .zos_range input {
+    width: 70px;
+}
+
+#zos_settings .zos_range > span {
+    font-size: calc(var(--mainFontSize) * 0.9);
+    opacity: 0.85;
+    white-space: nowrap;
+}

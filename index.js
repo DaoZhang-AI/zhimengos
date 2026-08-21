@@ -20,14 +20,14 @@ import { ConnectionManagerRequestService } from '../../shared.js';
 // ⚠️ 这两个 import 后面的 ?v= 要跟着版本号一起改。
 // manifest 里的 ?v= 只管 index.js,管不到它 import 进来的文件,
 // 不带的话改了库文件浏览器还喂旧的那份。
-import { fuzzyAgo, fuzzyRange, displayTime } from './lib/fuzzy-time.js?v=0.11.0';
-import { maintain, buildMemoryText, describe, DEFAULTS as MEM_DEFAULTS } from './lib/rolling-summary.js?v=0.11.0';
+import { fuzzyAgo, fuzzyRange, displayTime } from './lib/fuzzy-time.js?v=0.12.0';
+import { maintain, buildMemoryText, describe, DEFAULTS as MEM_DEFAULTS } from './lib/rolling-summary.js?v=0.12.0';
 import { callGenericPopup, POPUP_TYPE } from '../../../popup.js';
 import { writeSecret, SECRET_KEYS } from '../../../secrets.js';
 import { uuidv4 } from '../../../utils.js';
 
 /** 跟 manifest.json 的 version 手动保持一致,靠这行在控制台辨认在跑哪一版 */
-const VERSION = '0.11.0';
+const VERSION = '0.12.0';
 
 /** 必须和仓库名、文件夹名一致,理由见织梦者里那段注释 */
 const MODULE_NAME = 'zhimengos';
@@ -61,6 +61,12 @@ const defaultSettings = {
     phonePos: null,
     /** 分层摘要的三个数字,含义见 lib/rolling-summary.js */
     memory: { ...MEM_DEFAULTS },
+    /** 一次回几条。**给模型的是范围里随机抽的一个具体数字**,不是范围本身:
+     *  给具体数字的遵守度比给范围高得多,而随机由我们掌握,效果一样。 */
+    replyMin: 2,
+    replyMax: 4,
+    /** 回复一条一条往外冒,像真人在打字。嫌慢的人可以关掉 */
+    typing: true,
     /** 写摘要用哪条连接。空 = 和聊天用同一条。
      *  单独一条的理由(2026-08-21 道长):**有人聊天爱用 flash,聊天还行,写摘要爱瞎写。**
      *  聊天要的是语感,摘要要的是老实,这两件事本来就该允许用不同的模型。 */
@@ -1376,7 +1382,7 @@ function renderRecent(messages, now) {
 }
 
 /** 拼出要发出去的那一份 */
-function buildPrompt(contact) {
+function buildPrompt(contact, count) {
     const now = Date.now();
     const nick = contact.nick || '对方';
 
@@ -1396,11 +1402,16 @@ function buildPrompt(contact) {
     parts.push(
         '',
         '【怎么回】',
-        '像发消息一样说话,短句。一次回一到三条。',
-        '想分成几条就换行,一行就是一条消息。',
+        `这次回 ${count} 条消息。`,
+        '每条用 <msg> 包起来,一条一个,像这样:',
+        '<msg>在吗</msg>',
+        '<msg>刚看到你消息</msg>',
+        '',
+        '像发消息一样说话,短句。',
         '不要写旁白、动作、心理描写,这是纯文字聊天。',
         '不要复述方括号里的时间,那只是给你参考用的。',
-        '不要重复对方刚说过的话。');
+        '不要重复对方刚说过的话。',
+        '除了 <msg> 之外不要输出任何别的东西。');
 
     // 保留窗口内的正文,更早的已经在摘要里了
     const keep = getSettings().memory.keepRaw;
@@ -1464,13 +1475,57 @@ async function runGeneration(messages, maxTokens = MAX_REPLY_TOKENS, connId = nu
     throw new Error('还没选连接。去扩展设置里的织梦OS,挑一条「手机用哪个连接」。');
 }
 
-/** 模型可能一口气回好几行,一行当一条消息,像真人一样 */
-function splitReply(text) {
-    return String(text || '')
-        .split(LF)
-        .map(line => line.replace(/^\[[^\]]*\]\s*/, '').trim())
-        .filter(Boolean)
-        .slice(0, 5);
+/**
+ * 把模型回的东西拆成一条条消息。
+ *
+ * 先认 <msg> 标签:边界明确,模型自己排版换个行也不会多出一条,
+ * 而且以后要加图片、语音、延迟,都有地方挂属性。
+ *
+ * **认不到标签就退回按换行切**:模型偶尔会忘了包标签,
+ * 那时候宁可切得糙一点,也不能一条都出不来。
+ */
+function splitReply(text, limit) {
+    const raw = String(text || '');
+    const tagged = [...raw.matchAll(/<msg[^>]*>([\s\S]*?)<\/msg>/gi)].map(m => m[1]);
+
+    const lines = (tagged.length ? tagged : raw.split(LF))
+        // 模型有时会把参考用的时间标记也抄进来,去掉
+        .map(line => String(line).replace(/^\[[^\]]*\]\s*/, '').trim())
+        // 没包住的残标签也清掉
+        .map(line => line.replace(/<\/?msg[^>]*>/gi, '').trim())
+        .filter(Boolean);
+
+    // 说好几条就几条,多的截掉。**提示词管不住的地方由代码兜底**
+    return lines.slice(0, Math.max(1, limit || 5));
+}
+
+/** 在设定的范围里掷一个数 */
+function pickReplyCount() {
+    const settings = getSettings();
+    const low = Math.max(1, Math.min(settings.replyMin, settings.replyMax));
+    const high = Math.max(low, settings.replyMax);
+    return low + Math.floor(Math.random() * (high - low + 1));
+}
+
+/** 打字要花时间,条数多就多给点 token,不然后面几条会被截断 */
+function tokensFor(count) {
+    return Math.max(300, count * 110);
+}
+
+/** 一条消息假装打了多久。按字数算,给个上下限,太快像机器太慢像卡住 */
+function typingDelayFor(text) {
+    return Math.min(2600, Math.max(450, String(text || '').length * 90));
+}
+
+function appendBubble(message) {
+    const html = `
+        <div class="zos_msg zos_msg_them">
+            <div class="zos_bubble">${escapeHtml(message.text)}</div>
+            <div class="zos_msg_time">${escapeHtml(displayTime(message.t))}</div>
+        </div>`;
+
+    $('.zos_msgs').append(html);
+    scrollMessagesToEnd();
 }
 
 function scrollMessagesToEnd() {
@@ -1503,19 +1558,16 @@ async function onSend() {
     $('.zos_msgs').append('<div class="zos_typing">正在输入...</div>');
     scrollMessagesToEnd();
 
+    const count = pickReplyCount();
+
     try {
-        const reply = await runGeneration(buildPrompt(contact));
-        const lines = splitReply(reply);
+        const reply = await runGeneration(buildPrompt(contact, count), tokensFor(count));
+        const lines = splitReply(reply, count);
 
         if (!lines.length) throw new Error('模型返回了空的');
 
-        for (const line of lines) {
-            contact.messages.push({ from: 'them', text: line, t: Date.now() });
-        }
-
-        await saveWhere(contact.id);
-        renderScreen();
-        scrollMessagesToEnd();
+        $('.zos_typing').remove();
+        await deliver(contact, lines);
 
         // 存完再维护。**维护会动正文,所以必须在正文已经落盘之后**
         await runMaintain(contact);
@@ -1528,6 +1580,45 @@ async function onSend() {
             POPUP_TYPE.TEXT, '', { okButton: '知道了', wide: true });
     } finally {
         sending = false;
+    }
+}
+
+/**
+ * 把几条回复一条条送出来,像真人在打字。
+ *
+ * **每一条都当场落盘**,不是等全部演完再存:演到一半刷新页面、切聊天、关浏览器,
+ * 已经冒出来的那几条都得留住,不能因为动画没播完就当没发生。
+ */
+async function deliver(contact, lines) {
+    const settings = getSettings();
+    const animate = settings.typing;
+
+    for (let i = 0; i < lines.length; i++) {
+        const message = { from: 'them', text: lines[i], t: Date.now() };
+        contact.messages.push(message);
+        await saveWhere(contact.id);
+
+        // 她可能在演的过程中退出去了,那就别再往屏幕上画,数据已经存好了
+        const stillHere = screen === 'chat_room' && openChatId === contact.id;
+
+        if (!animate) continue;
+        if (stillHere) appendBubble(message);
+
+        if (i < lines.length - 1) {
+            if (stillHere) {
+                $('.zos_msgs').append('<div class="zos_typing">正在输入...</div>');
+                scrollMessagesToEnd();
+            }
+
+            await new Promise(resolve => setTimeout(resolve, typingDelayFor(lines[i + 1])));
+            $('.zos_typing').remove();
+        }
+    }
+
+    // 不管演没演、演到哪儿,最后都按数据重画一次,保证屏幕和存的东西一致
+    if (screen === 'chat_room' && openChatId === contact.id) {
+        renderScreen();
+        scrollMessagesToEnd();
     }
 }
 
@@ -1937,6 +2028,27 @@ function renderPanel() {
                 </div>
 
                 <hr>
+                <b>回复</b>
+                <div class="zos_hint">一次回几条。<b>给模型的是范围里随机抽的一个具体数字</b>,
+                    不是范围本身,因为给具体数字它更听话,而随机由我们掌握,效果一样。
+                    它要是不听,多出来的条数会被截掉。</div>
+
+                <div class="zos_field zos_range">
+                    <span>一次回</span>
+                    <input id="zos_reply_min" type="number" min="1" max="20" class="text_pole" value="${settings.replyMin}">
+                    <span>到</span>
+                    <input id="zos_reply_max" type="number" min="1" max="20" class="text_pole" value="${settings.replyMax}">
+                    <span>条</span>
+                </div>
+
+                <label class="checkbox_label">
+                    <input id="zos_typing" type="checkbox" ${settings.typing ? 'checked' : ''}>
+                    <span>一条一条往外冒,像真人在打字</span>
+                </label>
+                <div class="zos_hint">关掉的话几条一起出来。<b>不管开不开,每条都是当场存好的</b>,
+                    演到一半刷新或者切走都不会丢。</div>
+
+                <hr>
                 <b>记忆</b>
                 <div class="zos_hint">聊天记录不会被丢掉,而是<b>攒够一批就压成一段摘要</b>,
                     最近的正文永远原样留着。这样上下线不会失忆,上下文也不会一直涨。
@@ -2036,6 +2148,22 @@ function renderPanel() {
         saveSettingsDebounced();
         renderConnectionDetail();
         $('#zos_model_count').text('');
+    });
+
+    $('#zos_reply_min, #zos_reply_max').on('input', function () {
+        const key = this.id === 'zos_reply_min' ? 'replyMin' : 'replyMax';
+        const value = Number($(this).val());
+
+        // 填一半的时候别把设置写坏
+        if (!Number.isFinite(value) || value <= 0) return;
+
+        getSettings()[key] = Math.round(value);
+        saveSettingsDebounced();
+    });
+
+    $('#zos_typing').on('input', function () {
+        getSettings().typing = Boolean($(this).prop('checked'));
+        saveSettingsDebounced();
     });
 
     $('#zos_sum_conn').on('change', function () {
