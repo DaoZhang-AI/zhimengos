@@ -13,21 +13,25 @@
 
 import { extension_settings, writeExtensionField } from '../../../extensions.js';
 import { getContext } from '../../../st-context.js';
-import { saveSettingsDebounced, getRequestHeaders, characters, getThumbnailUrl, chat_metadata, saveMetadata } from '../../../../script.js';
+import {
+    saveSettingsDebounced, getRequestHeaders, characters, getThumbnailUrl, chat_metadata, saveMetadata,
+    selectCharacterById, openCharacterChat, getPastCharacterChats, setActiveCharacter, setActiveGroup,
+} from '../../../../script.js';
+import { groups, openGroupById, openGroupChat } from '../../../group-chats.js';
 import { eventSource, event_types } from '../../../events.js';
 import { uploadFileAttachment } from '../../../chats.js';
 import { ConnectionManagerRequestService } from '../../shared.js';
 // ⚠️ 这两个 import 后面的 ?v= 要跟着版本号一起改。
 // manifest 里的 ?v= 只管 index.js,管不到它 import 进来的文件,
 // 不带的话改了库文件浏览器还喂旧的那份。
-import { fuzzyAgo, fuzzyRange, displayTime } from './lib/fuzzy-time.js?v=0.12.0';
-import { maintain, buildMemoryText, describe, DEFAULTS as MEM_DEFAULTS } from './lib/rolling-summary.js?v=0.12.0';
+import { fuzzyAgo, fuzzyRange, displayTime } from './lib/fuzzy-time.js?v=0.13.0';
+import { maintain, buildMemoryText, describe, DEFAULTS as MEM_DEFAULTS } from './lib/rolling-summary.js?v=0.13.0';
 import { callGenericPopup, POPUP_TYPE } from '../../../popup.js';
 import { writeSecret, SECRET_KEYS } from '../../../secrets.js';
 import { uuidv4 } from '../../../utils.js';
 
 /** 跟 manifest.json 的 version 手动保持一致,靠这行在控制台辨认在跑哪一版 */
-const VERSION = '0.12.0';
+const VERSION = '0.13.0';
 
 /** 必须和仓库名、文件夹名一致,理由见织梦者里那段注释 */
 const MODULE_NAME = 'zhimengos';
@@ -361,6 +365,11 @@ function utf8ToBase64(text) {
 function loadLocal() {
     const data = chat_metadata?.[META_KEY];
     localContacts = Array.isArray(data?.contacts) ? data.contacts : [];
+
+    if (takePending()) {
+        saveLocal();
+        toastr.info('上次等回复时切走了,那几条回复已经补回这一局', '织梦OS');
+    }
 }
 
 async function saveLocal() {
@@ -413,6 +422,99 @@ async function saveWhere(id) {
     else await saveLocal();
 }
 
+/* ---------- 等回复时切走了聊天:先寄存,回到那一局再补进去 ----------
+ *
+ * 由来(2026-09-13 查「关窗口聊天就没了」时发现):发出去之后模型要想好几秒,
+ * 这期间切到别的聊天,回复回来时 chat_metadata 已经是另一局的了。
+ * 原来的写法会把回复塞进一个已经不在任何名单里的对象,再把**新那一局**存一遍,
+ * 回复就这样凭空没了。
+ *
+ * 不去改那个没打开的聊天文件:那要整份读出来再整份写回去,她的聊天有几 MB,
+ * 而且万一她这时又切回去,两边同时写就是真毁档。
+ * 所以先寄存在这台设备的 localStorage,回到那一局时补进去。只是个中转,补完就删。
+ */
+
+const PENDING_KEY = 'zhimengos-pending';
+
+/** 现在打开的是哪一局。没开聊天时是空字符串 */
+function currentChatKey() {
+    return String(getContext()?.chatId || '');
+}
+
+function readPending() {
+    try {
+        return JSON.parse(localStorage.getItem(PENDING_KEY) || '{}') || {};
+    } catch {
+        return {};
+    }
+}
+
+function writePending(data) {
+    try {
+        if (Object.keys(data).length) localStorage.setItem(PENDING_KEY, JSON.stringify(data));
+        else localStorage.removeItem(PENDING_KEY);
+    } catch {
+        // 存不了就算了,至多是这一次的回复补不回来,不影响别的
+    }
+}
+
+/**
+ * 存一个联系人,但先确认他还在他出发时那一局里。
+ * @param {Contact} contact
+ * @param {string} chatKey 发消息那一刻的聊天
+ * @returns {Promise<boolean>} 真 = 存进去了;假 = 已经切走,寄存起来了
+ */
+async function saveContactFrom(contact, chatKey) {
+    if (isGlobal(contact.id)) {
+        await saveGlobal();
+        return true;
+    }
+
+    if (currentChatKey() === chatKey) {
+        // 切走又切回来的话,名单是重新读盘读出来的,里面那个同 id 的对象不是手上这个,
+        // 手上这个比它多了这几秒新到的回复,换成手上这个再存
+        const index = localContacts.findIndex(c => c.id === contact.id);
+        if (index !== -1) {
+            localContacts[index] = contact;
+            await saveLocal();
+            return true;
+        }
+    }
+
+    if (!chatKey) return false;
+
+    const pending = readPending();
+    pending[chatKey] = { ...(pending[chatKey] || {}), [contact.id]: contact };
+    writePending(pending);
+    return false;
+}
+
+/** 打开一局时,把之前寄存的回复补进去。@returns 补了几个联系人 */
+function takePending() {
+    const chatKey = currentChatKey();
+    const pending = readPending();
+    const here = pending[chatKey];
+
+    if (!chatKey || !here) return 0;
+
+    let count = 0;
+
+    for (const saved of Object.values(here)) {
+        const index = localContacts.findIndex(c => c.id === saved.id);
+        // 这个人在这局里已经被删了,那就尊重删除,不复活
+        if (index === -1) continue;
+        // 寄存的那份是从这局读出去再往后长的,条数不会比盘上少;少了说明盘上后来又变过,不去盖
+        if ((saved.messages?.length || 0) < (localContacts[index].messages?.length || 0)) continue;
+
+        localContacts[index] = saved;
+        count++;
+    }
+
+    delete pending[chatKey];
+    writePending(pending);
+    return count;
+}
+
 /* ---------- 卡里那一份:创作者烤进去的,发卡时跟着走 ----------
  *
  * 存在角色卡的 data.extensions.zhimengos,那是角色卡规范里给扩展留的位置,
@@ -448,6 +550,214 @@ function avatarOf(contact) {
     return '';
 }
 
+/* ==========================================================================
+ * 收藏夹:没打开聊天时,手机里显示的就是它
+ *
+ * 由来(2026-09-13 道长定):手机记录跟着酒馆聊天走,一个角色有无数个聊天,
+ * 重开浏览器停在欢迎页时手机里什么都没有,她以为聊天丢了。
+ * 所以没开聊天时给一个收藏夹:**按角色分组,一条就是这个角色的一个酒馆聊天**(分支也算),
+ * 点一下酒馆就切到那一局,手机打开那一局的记录。备注名可以改。
+ *
+ * **归属按酒馆聊天属于谁**:在 Char1 的聊天里把 Char2 拉进手机,收藏后出现在 Char1 组下
+ * (道长:逻辑是"在这个角色的聊天里把别的角色拉进来聊天")。
+ *
+ * 存在 user/files 自己的文件里,不进 settings.json。
+ * ========================================================================== */
+
+const FAV_FILE = 'zhimengos-favorites.json';
+
+/**
+ * @typedef {object} Favorite
+ * @property {string} avatar 角色卡的头像文件名。群聊时为空
+ * @property {string} group  酒馆群聊的 id。角色卡时为空
+ * @property {string} file   聊天名,不带 .jsonl,和 getContext().chatId 同一个口径
+ * @property {string} remark 备注名。空 = 显示聊天名
+ */
+
+/** @type {Favorite[]} */
+let favorites = [];
+
+/** 从收藏夹跳过去的途中会触发换聊天事件,这时候别把手机关掉 */
+let jumping = false;
+
+function stripJsonl(name) {
+    return String(name || '').replace(/\.jsonl$/i, '');
+}
+
+async function loadFavorites() {
+    try {
+        const response = await fetch(`/user/files/${FAV_FILE}?t=${new Date().getTime()}`, { cache: 'no-cache' });
+        if (!response.ok) {
+            favorites = [];
+            return;
+        }
+
+        const data = await response.json();
+        favorites = Array.isArray(data?.items) ? data.items : [];
+    } catch {
+        // 头一回用还没有这个文件
+        favorites = [];
+    }
+}
+
+async function saveFavorites() {
+    const json = JSON.stringify({ version: 1, items: favorites }, null, 2);
+    const path = await uploadFileAttachment(FAV_FILE, utf8ToBase64(json));
+    if (!path) console.error('[织梦OS] 收藏夹没存进去');
+}
+
+/** @returns {Favorite|null} 现在打开的这一局,还没开聊天时为 null */
+function currentPlace() {
+    const context = getContext();
+    const file = currentChatKey();
+    if (!file) return null;
+
+    if (context.groupId) return { avatar: '', group: String(context.groupId), file, remark: '' };
+
+    const card = characters[context.characterId];
+    if (!card?.avatar) return null;
+    return { avatar: card.avatar, group: '', file, remark: '' };
+}
+
+function favoriteIndexOf(place) {
+    if (!place) return -1;
+    return favorites.findIndex(f => f.avatar === place.avatar && f.group === place.group && f.file === place.file);
+}
+
+/** 收藏夹里组名:角色卡名或群名 */
+function ownerName(f) {
+    if (f.group) return groups.find(g => g.id === f.group)?.name || '(群聊已经不在了)';
+    return characters.find(c => c.avatar === f.avatar)?.name || '(角色卡已经不在了)';
+}
+
+/** 「Char1 @备注名」这种写法,列表和顶上那行共用 */
+function placeLabel(f) {
+    return `${ownerName(f)} @${f.remark || f.file}`;
+}
+
+async function onToggleFavorite() {
+    const place = currentPlace();
+    if (!place) return;
+
+    const index = favoriteIndexOf(place);
+
+    if (index === -1) {
+        favorites.push(place);
+        toastr.success('收藏了这一局。没打开聊天时,手机里点它就能跳回来', '织梦OS');
+    } else {
+        // 只是拿掉一个快捷方式,聊天和手机记录都不动,所以不用问
+        favorites.splice(index, 1);
+    }
+
+    await saveFavorites();
+    renderScreen();
+}
+
+async function onRenameFavorite(index) {
+    const f = favorites[index];
+    if (!f) return;
+
+    // 留住引用再读,理由见 onAddContact
+    const container = document.createElement('div');
+    container.className = 'zos_popup';
+
+    const title = document.createElement('div');
+    title.textContent = `给「${ownerName(f)}」这一局起个备注名`;
+
+    const input = document.createElement('input');
+    input.className = 'text_pole';
+    input.style.width = '100%';
+    input.style.marginTop = '8px';
+    input.value = f.remark || '';
+    input.placeholder = f.file;
+
+    const hint = document.createElement('div');
+    hint.className = 'zos_hint';
+    hint.style.marginTop = '6px';
+    hint.textContent = '留空就显示酒馆里的聊天名。只改手机里显示的名字,不动酒馆的聊天文件。';
+
+    container.append(title, input, hint);
+
+    const ok = await callGenericPopup(container, POPUP_TYPE.CONFIRM, '', { okButton: '好', cancelButton: '算了' });
+    if (!ok) return;
+
+    f.remark = String(input.value || '').trim();
+    await saveFavorites();
+    renderScreen();
+}
+
+/** 这一局打不开时问一句要不要从收藏夹拿掉。不自动拿,万一只是卡还没加载出来 */
+async function offerRemoveFavorite(index, why) {
+    const ok = await callGenericPopup(
+        `<div class="zos_popup">这一局打不开:${escapeHtml(why)}
+        <div class="zos_hint" style="margin-top:6px">可能是聊天被删了。要把它从收藏夹里拿掉吗?
+        只是拿掉快捷方式,别的什么都不动。</div></div>`,
+        POPUP_TYPE.CONFIRM, '', { okButton: '拿掉', cancelButton: '先留着' });
+
+    if (!ok) return;
+
+    favorites.splice(index, 1);
+    await saveFavorites();
+    renderScreen();
+}
+
+/**
+ * 从收藏夹跳到那一局。照抄酒馆欢迎页「最近聊天」的打开顺序
+ * (public/scripts/welcome-screen.js 的 openRecentCharacterChat / openRecentGroupChat):
+ * 先选中角色或群,不是那一局再切聊天。
+ */
+async function onOpenFavorite(index) {
+    const f = favorites[index];
+    if (!f) return;
+
+    jumping = true;
+
+    try {
+        if (f.group) {
+            const group = groups.find(g => g.id === f.group);
+            if (!group) return await offerRemoveFavorite(index, '这个群聊已经不在了');
+            if (!group.chats?.includes(f.file)) return await offerRemoveFavorite(index, '群里没有这个聊天了');
+
+            await openGroupById(f.group);
+
+            // 酒馆在生成中、存档中会拒绝切换,这时候绝不能接着切聊天,不然切的是别人的
+            if (String(getContext().groupId) !== f.group) {
+                toastr.info('酒馆现在忙,等它生成完或存完再点', '织梦OS');
+                return;
+            }
+
+            setActiveGroup(f.group);
+            if (currentChatKey() !== f.file) await openGroupChat(f.group, f.file);
+        } else {
+            const id = characters.findIndex(c => c.avatar === f.avatar);
+            if (id === -1) return await offerRemoveFavorite(index, '这张角色卡已经不在了');
+
+            const chats = await getPastCharacterChats(id);
+            if (!chats.some(c => stripJsonl(c.file_name) === f.file)) {
+                return await offerRemoveFavorite(index, '这张卡下面没有这个聊天了');
+            }
+
+            await selectCharacterById(id);
+
+            // 同上。openCharacterChat 是往"当前选中的角色"身上切,选中失败时往下走会切错人
+            if (String(getContext().characterId) !== String(id)) {
+                toastr.info('酒馆现在忙,等它生成完或存完再点', '织梦OS');
+                return;
+            }
+
+            setActiveCharacter(f.avatar);
+            if (currentChatKey() !== f.file) await openCharacterChat(f.file);
+        }
+
+        saveSettingsDebounced();
+    } finally {
+        jumping = false;
+    }
+
+    loadLocal();
+    goto('chat_list');
+}
+
 function nowClock() {
     const d = new Date();
     return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
@@ -463,18 +773,93 @@ function renderHome() {
     return `
         <div class="zos_home">
             <div class="zos_home_grid">${icons}</div>
-            <div class="zos_home_note">灰的那些还没做。这一版是壳,聊天里是示例数据。</div>
+            <div class="zos_home_note">灰的那些还没做。</div>
         </div>`;
 }
 
+/** 没打开聊天时:收藏夹按角色分组,底下是常驻联系人(他们不挑聊天,在哪都能聊) */
+function renderFavorites() {
+    /** @type {Map<string, number[]>} 组 → 收藏夹里的下标 */
+    const owners = new Map();
+
+    favorites.forEach((f, i) => {
+        const key = f.group ? `g:${f.group}` : `c:${f.avatar}`;
+        if (!owners.has(key)) owners.set(key, []);
+        owners.get(key).push(i);
+    });
+
+    const blocks = [...owners.values()].map(indexes => {
+        const name = ownerName(favorites[indexes[0]]);
+
+        const rows = indexes.map(i => {
+            const f = favorites[i];
+            return `
+            <div class="zos_chat_row zos_fav_row" data-fav="${i}">
+                <div class="zos_chat_mid">
+                    <div class="zos_chat_name">${escapeHtml(name)} <span class="zos_fav_at">@${escapeHtml(f.remark || f.file)}</span></div>
+                </div>
+                <div class="zos_fav_rename" data-fav="${i}" title="改备注名">✎</div>
+            </div>`;
+        }).join('');
+
+        return `<div class="zos_group_head">${escapeHtml(name)}</div>${rows}`;
+    }).join('');
+
+    const residents = globalContacts.length
+        ? `<div class="zos_group_head">常驻联系人</div>${globalContacts.map(c => renderContactRow({ ...c, global: true })).join('')}`
+        : '';
+
+    const empty = `
+        <div class="zos_empty">
+            <div class="zos_empty_big">还没打开聊天</div>
+            <div>手机记录是跟着酒馆聊天存的,先在酒馆里打开一个聊天就能看到。</div>
+            <div>想以后一点就回到某一局:进那个聊天后,在这一屏右上角点 ☆ 收藏。</div>
+        </div>`;
+
+    return `
+        <div class="zos_appbar">
+            <div class="zos_back" data-to="home">‹</div>
+            <div class="zos_appbar_title">收藏夹</div>
+            <div class="zos_appbar_right"></div>
+        </div>
+        <div class="zos_list">${blocks || residents ? blocks + residents : empty}</div>`;
+}
+
 function renderChatList() {
+    const place = currentPlace();
+    if (!place) return renderFavorites();
+
     const list = allContacts();
+    const starred = favoriteIndexOf(place) !== -1;
+    const rows = list.map(renderContactRow).join('');
 
-    const rows = list.map(c => {
-        const last = c.messages?.length ? c.messages[c.messages.length - 1] : null;
-        const avatar = avatarOf(c);
+    const empty = `
+        <div class="zos_empty">
+            <div class="zos_empty_big">还没有联系人</div>
+            <div>点右上角的加号,从你的角色列表里挑一个加进来。</div>
+        </div>`;
 
-        return `
+    // 顶上写明这是哪一局的手机,切了聊天手机跟着换,不写的话会以为东西丢了
+    const current = favorites[favoriteIndexOf(place)] || place;
+
+    return `
+        <div class="zos_appbar">
+            <div class="zos_back" data-to="home">‹</div>
+            <div class="zos_appbar_title">聊天</div>
+            <div class="zos_appbar_right">
+                <div class="zos_star ${starred ? 'zos_star_on' : ''}" title="${starred ? '取消收藏这一局' : '收藏这一局'}">${starred ? '★' : '☆'}</div>
+                <div class="zos_add" title="加联系人">+</div>
+            </div>
+        </div>
+        <div class="zos_list_where">这是「${escapeHtml(placeLabel(current))}」这一局的手机</div>
+        <div class="zos_list">${list.length ? rows : empty}</div>`;
+}
+
+function renderContactRow(c) {
+    const last = c.messages?.length ? c.messages[c.messages.length - 1] : null;
+    const avatar = avatarOf(c);
+
+    return `
         <div class="zos_chat_row" data-chat="${escapeHtml(c.id)}">
             <div class="zos_avatar">${avatar
                 ? `<img src="${escapeHtml(avatar)}" alt="">`
@@ -487,21 +872,6 @@ function renderChatList() {
                 <div class="zos_chat_time">${escapeHtml(last ? displayTime(last.t) : '')}</div>
             </div>
         </div>`;
-    }).join('');
-
-    const empty = `
-        <div class="zos_empty">
-            <div class="zos_empty_big">还没有联系人</div>
-            <div>点右上角的加号,从你的角色列表里挑一个加进来。</div>
-        </div>`;
-
-    return `
-        <div class="zos_appbar">
-            <div class="zos_back" data-to="home">‹</div>
-            <div class="zos_appbar_title">聊天</div>
-            <div class="zos_appbar_right"><div class="zos_add" title="加联系人">+</div></div>
-        </div>
-        <div class="zos_list">${list.length ? rows : empty}</div>`;
 }
 
 function renderChatRoom() {
@@ -684,9 +1054,19 @@ function buildPhone() {
         if (app === 'chat') goto('chat_list');
     });
 
-    $('#zos_screen').on('click', '.zos_chat_row', function () {
+    $('#zos_screen').on('click', '.zos_chat_row[data-chat]', function () {
         goto('chat_room', String($(this).data('chat')));
     });
+
+    $('#zos_screen').on('click', '.zos_fav_row', function () {
+        onOpenFavorite(Number($(this).data('fav')));
+    });
+    $('#zos_screen').on('click', '.zos_fav_rename', function (event) {
+        // 别让点铅笔同时触发整行的"跳过去"
+        event.stopPropagation();
+        onRenameFavorite(Number($(this).data('fav')));
+    });
+    $('#zos_screen').on('click', '.zos_star', () => onToggleFavorite());
 
     $('#zos_screen').on('click', '.zos_back', function () {
         goto(String($(this).data('to')));
@@ -1053,9 +1433,9 @@ async function openPhone() {
     buildPhone();
     renderScreen();
 
-    // 每次开都重读一遍:常驻那份是全局的,别的标签页可能改过
+    // 每次开都重读一遍:常驻那份和收藏夹是全局的,别的标签页可能改过
     loadLocal();
-    await loadGlobal();
+    await Promise.all([loadGlobal(), loadFavorites()]);
     renderScreen();
 
     await offerCardImport();
@@ -1547,12 +1927,15 @@ async function onSend() {
     sending = true;
     input.value = '';
 
+    // 记下是在哪一局发的。等回复那几秒她可能切走,回复得回到这一局去
+    const chatKey = currentChatKey();
+
     if (!Array.isArray(contact.messages)) contact.messages = [];
     contact.messages.push({ from: 'me', text, t: Date.now() });
 
     renderScreen();
     scrollMessagesToEnd();
-    await saveWhere(contact.id);
+    await saveContactFrom(contact, chatKey);
 
     // 等回复时给个"正在输入",不然按下去像没反应
     $('.zos_msgs').append('<div class="zos_typing">正在输入...</div>');
@@ -1567,10 +1950,11 @@ async function onSend() {
         if (!lines.length) throw new Error('模型返回了空的');
 
         $('.zos_typing').remove();
-        await deliver(contact, lines);
+        await deliver(contact, lines, chatKey);
 
-        // 存完再维护。**维护会动正文,所以必须在正文已经落盘之后**
-        await runMaintain(contact);
+        // 存完再维护。**维护会动正文,所以必须在正文已经落盘之后**。
+        // 切走了就不维护:正文还寄存着没落盘,这时候压缩等于拿没存的东西去删东西
+        if (currentChatKey() === chatKey || isGlobal(contact.id)) await runMaintain(contact, chatKey);
     } catch (error) {
         renderScreen();
         await callGenericPopup(
@@ -1589,14 +1973,14 @@ async function onSend() {
  * **每一条都当场落盘**,不是等全部演完再存:演到一半刷新页面、切聊天、关浏览器,
  * 已经冒出来的那几条都得留住,不能因为动画没播完就当没发生。
  */
-async function deliver(contact, lines) {
+async function deliver(contact, lines, chatKey) {
     const settings = getSettings();
     const animate = settings.typing;
 
     for (let i = 0; i < lines.length; i++) {
         const message = { from: 'them', text: lines[i], t: Date.now() };
         contact.messages.push(message);
-        await saveWhere(contact.id);
+        await saveContactFrom(contact, chatKey);
 
         // 她可能在演的过程中退出去了,那就别再往屏幕上画,数据已经存好了
         const stillHere = screen === 'chat_room' && openChatId === contact.id;
@@ -1623,7 +2007,7 @@ async function deliver(contact, lines) {
 }
 
 /** 该摘要就摘要,该压缩就压缩。失败不吭声,下次再来,反正正文一条没丢 */
-async function runMaintain(contact) {
+async function runMaintain(contact, chatKey) {
     const settings = getSettings();
 
     // 摘要走自己那条连接。空的话 summaryConnId 是 '',而 runGeneration 的第三个参数
@@ -1642,7 +2026,7 @@ async function runMaintain(contact) {
 
     if (result.changed) {
         console.log('[织梦OS]', result.did);
-        await saveWhere(contact.id);
+        await saveContactFrom(contact, chatKey);
         renderScreen();
     }
 }
@@ -2191,12 +2575,32 @@ jQuery(async () => {
     applyBall();
 
     // 换聊天就换一部手机。切走时若手机开着,把它关掉,免得看着上一局的联系人
+    // 从收藏夹跳过来的例外:那是在手机里点的,跳完要留在手机里看那一局
     eventSource.on(event_types.CHAT_CHANGED, () => {
         loadLocal();
+        if (jumping) return;
         if (!$('#zos_phone_wrap').hasClass('zos_hidden')) closePhone();
     });
 
+    // 酒馆里改了聊天名,收藏夹跟着改,不然下次点就是"打不开"
+    eventSource.on(event_types.CHAT_RENAMED, async ({ avatarId, groupId, oldFileName, newFileName }) => {
+        const from = stripJsonl(oldFileName);
+        const to = stripJsonl(newFileName);
+        let changed = false;
+
+        for (const f of favorites) {
+            const sameOwner = groupId ? f.group === String(groupId) : f.avatar === avatarId;
+            if (sameOwner && f.file === from) {
+                f.file = to;
+                changed = true;
+            }
+        }
+
+        if (changed) await saveFavorites();
+    });
+
     loadLocal();
+    loadFavorites();
 
     if (!isConnectionManagerAvailable()) {
         console.warn('[织梦OS] 酒馆自带的连接管理器不可用,只能用 API 管理器里的配置或者跟主线走');

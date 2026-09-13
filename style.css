@@ -472,7 +472,8 @@
     flex: 0 0 auto;
     height: 42px;
     display: grid;
-    grid-template-columns: 40px 1fr 40px;
+    /* 右边要放得下 ☆ 和 + 两个,左右对称才能让标题真的居中 */
+    grid-template-columns: 56px 1fr 56px;
     align-items: center;
     border-bottom: 1px solid var(--zos-line);
 }
@@ -706,10 +707,12 @@
     display: flex;
     align-items: center;
     justify-content: center;
+    gap: 10px;
 }
 
 .zos_add,
-.zos_more {
+.zos_more,
+.zos_star {
     font-size: 22px;
     line-height: 1;
     cursor: pointer;
@@ -895,4 +898,51 @@
     font-size: calc(var(--mainFontSize) * 0.9);
     opacity: 0.85;
     white-space: nowrap;
+}
+
+/* ---------- 收藏夹 ---------- */
+
+/* 聊天列表顶上那行"这是哪一局的手机" */
+.zos_list_where {
+    flex: 0 0 auto;
+    padding: 5px 12px;
+    font-size: 10px;
+    color: var(--zos-ink-dim);
+    border-bottom: 1px solid var(--zos-line);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.zos_star {
+    font-size: 18px;
+}
+
+.zos_star_on {
+    color: #f5c451;
+    opacity: 1;
+}
+
+/* 收藏夹里的组名,角色卡名或"常驻联系人" */
+.zos_group_head {
+    padding: 10px 12px 4px;
+    font-size: 11px;
+    color: var(--zos-ink-dim);
+}
+
+.zos_fav_at {
+    font-weight: normal;
+    color: var(--zos-ink-dim);
+}
+
+.zos_fav_rename {
+    flex: 0 0 auto;
+    padding: 4px 6px;
+    font-size: 14px;
+    cursor: pointer;
+    color: var(--zos-ink-dim);
+}
+
+.zos_fav_rename:hover {
+    color: var(--zos-ink);
 }
