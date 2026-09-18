@@ -26,14 +26,14 @@ import { ConnectionManagerRequestService } from '../../shared.js';
 // ⚠️ 这两个 import 后面的 ?v= 要跟着版本号一起改。
 // manifest 里的 ?v= 只管 index.js,管不到它 import 进来的文件,
 // 不带的话改了库文件浏览器还喂旧的那份。
-import { fuzzyAgo, fuzzyRange, displayTime } from './lib/fuzzy-time.js?v=0.14.0';
-import { maintain, buildMemoryText, describe, DEFAULTS as MEM_DEFAULTS } from './lib/rolling-summary.js?v=0.14.0';
+import { fuzzyAgo, fuzzyRange, displayTime } from './lib/fuzzy-time.js?v=0.14.1';
+import { maintain, buildMemoryText, describe, DEFAULTS as MEM_DEFAULTS } from './lib/rolling-summary.js?v=0.14.1';
 import { callGenericPopup, POPUP_TYPE } from '../../../popup.js';
 import { writeSecret, SECRET_KEYS } from '../../../secrets.js';
 import { uuidv4 } from '../../../utils.js';
 
 /** 跟 manifest.json 的 version 手动保持一致,靠这行在控制台辨认在跑哪一版 */
-const VERSION = '0.14.0';
+const VERSION = '0.14.1';
 
 /** 必须和仓库名、文件夹名一致,理由见织梦者里那段注释 */
 const MODULE_NAME = 'zhimengos';
@@ -81,8 +81,6 @@ const defaultSettings = {
     replyDelay: 3,
     /** 手机里的线上聊天要不要进主线上下文(道长 9/17:这是最早定的需求,线上线下要联动) */
     linkMain: true,
-    /** 进主线的是每个联系人最近多少条 */
-    linkCount: 20,
 };
 
 function getSettings() {
@@ -94,7 +92,7 @@ function getSettings() {
     if (!settings.models || typeof settings.models !== 'object') settings.models = {};
     // 补齐后来新增的键,老用户升级时不至于缺
     settings.memory = { ...MEM_DEFAULTS, ...(settings.memory || {}) };
-    for (const k of ['replyDelay', 'linkMain', 'linkCount']) {
+    for (const k of ['replyDelay', 'linkMain']) {
         if (!(k in settings)) settings[k] = defaultSettings[k];
     }
     return settings;
@@ -1042,12 +1040,12 @@ function refreshLink() {
     if (!settings.linkMain || !currentChatKey()) return clear();
 
     const now = Date.now();
-    const n = Math.max(1, Math.min(200, Number(settings.linkCount) || 20));
     const userName = getContext().name1 || '我';
     const blocks = [];
 
+    // 和手机自己记得的一模一样:全部摘要 + 全部还没摘要的正文(道长 9/18:线上线下都要保留全部记忆)
     for (const c of localContacts) {
-        const recent = (c.messages || []).slice(-n);
+        const recent = c.messages || [];
         if (!recent.length) continue;
         const nick = c.nick || '对方';
         const memory = buildMemoryText(c, (from, to) => fuzzyRange(from, to, now));
@@ -1996,9 +1994,9 @@ function buildPrompt(contact, count) {
         '你想发的话也可以,写成 <msg>[表情] 捂脸笑</msg>、<msg>[图片] 窗外在下雨</msg> 这样,方括号里只能是 表情、图片、礼物、位置 四种,偶尔用,别每次都用。',
         '除了 <msg> 之外不要输出任何别的东西。');
 
-    // 保留窗口内的正文,更早的已经在摘要里了
-    const keep = getSettings().memory.keepRaw;
-    const recent = (contact.messages || []).slice(-keep);
+    // 还没被摘要的正文**全部**带上:摘要要等攒过 keepRaw + batchSize 条才摘最老的一批,
+    // 之前只带最近 keepRaw 条,中间那几十条既不在摘要里也不在正文里,等于失忆(道长 9/18 逮到的)
+    const recent = contact.messages || [];
 
     return [
         { role: 'system', content: parts.join(LF) },
@@ -2705,16 +2703,12 @@ function renderSettings() {
                     <input id="zos_link_main" type="checkbox" ${settings.linkMain ? 'checked' : ''}>
                     <span>手机里的聊天进主线上下文</span>
                 </label>
-                <label class="zos_field">
-                    <span>每个联系人带最近几条</span>
-                    <input id="zos_link_count" type="number" min="1" max="200" class="text_pole" value="${settings.linkCount}">
-                </label>
-                <div class="zos_hint">开着的话,主线每次生成都能看到这一局手机里聊过什么,线下能接住线上的事。
+                <div class="zos_hint">开着的话,主线每次生成都能看到这一局手机里聊过的<b>全部</b>:更早的摘要 + 还没摘要的原话,和手机自己记得的一模一样。
                     只带<b>这一局</b>的联系人;常驻联系人跨局共用,不进主线,免得串到别的故事里。</div>
                 <hr>
                 <b>记忆</b>
                 <div class="zos_hint">聊天记录不会被丢掉,而是<b>攒够一批就压成一段摘要</b>,
-                    最近的正文永远原样留着。这样上下线不会失忆,上下文也不会一直涨。
+                    还没摘要的原话全部原样带着(至少 N 条,最多 N + 一次摘掉的条数)。这样上下线都不会失忆,上下文也不会一直涨。
                     <b>写摘要要花一次生成</b>,用的是上面选的那条连接。</div>
 
                 <label class="zos_field">
@@ -2896,13 +2890,6 @@ function renderPanel() {
     // 联动开关:关掉当场撤掉注入,不等下一轮
     $(document).on('input', '#zos_link_main', function () {
         getSettings().linkMain = Boolean($(this).prop('checked'));
-        saveSettingsDebounced();
-        refreshLink();
-    });
-    $(document).on('input', '#zos_link_count', function () {
-        const value = Number($(this).val());
-        if (!Number.isFinite(value) || value <= 0) return;
-        getSettings().linkCount = Math.min(200, Math.round(value));
         saveSettingsDebounced();
         refreshLink();
     });
