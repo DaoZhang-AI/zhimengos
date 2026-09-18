@@ -946,3 +946,202 @@
 .zos_fav_rename:hover {
     color: var(--zos-ink);
 }
+
+/* ==========================================================================
+ * 9/18:头像常驻、「+」菜单、消息卡片、手机里的设置页
+ * ========================================================================== */
+
+/* 一条消息一行:对方头像在左,自己的在右(道长 9/17) */
+.zos_msg_row {
+    display: flex;
+    align-items: flex-start;
+    gap: 6px;
+}
+
+.zos_msg_row_me {
+    justify-content: flex-end;
+}
+
+.zos_msg_row .zos_msg {
+    max-width: calc(100% - 80px);
+}
+
+.zos_msg_avatar {
+    flex: 0 0 auto;
+    width: 30px;
+    height: 30px;
+    border-radius: 9px;
+    overflow: hidden;
+    background-color: rgba(255, 255, 255, 0.12);
+    color: var(--zos-ink);
+    font-size: 12px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.zos_msg_avatar img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+}
+
+/* 表情、图片、礼物、位置:画成小卡片 */
+.zos_bubble_card {
+    display: flex;
+    gap: 7px;
+    align-items: center;
+}
+
+.zos_card_icon {
+    font-size: 20px;
+}
+
+.zos_card_mark {
+    display: block;
+    font-size: 10px;
+    opacity: 0.7;
+}
+
+/* 「+」按钮和它弹出的那一格 */
+.zos_plus {
+    flex: 0 0 auto;
+    width: 30px;
+    height: 30px;
+    border-radius: 50%;
+    border: 1px solid var(--zos-line);
+    color: var(--zos-ink);
+    font-size: 18px;
+    line-height: 28px;
+    text-align: center;
+    cursor: pointer;
+    align-self: center;
+}
+
+.zos_plus_panel {
+    flex: 0 0 auto;
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 6px;
+    padding: 8px;
+    border-top: 1px solid var(--zos-line);
+}
+
+.zos_plus_item {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 3px;
+    padding: 6px 2px;
+    border-radius: 10px;
+    background-color: rgba(255, 255, 255, 0.06);
+    color: var(--zos-ink);
+    font-size: 11px;
+    text-align: center;
+    cursor: pointer;
+}
+
+.zos_plus_item:hover {
+    background-color: rgba(255, 255, 255, 0.12);
+}
+
+.zos_plus_wide {
+    grid-column: span 2;
+    flex-direction: row;
+    justify-content: flex-start;
+    gap: 6px;
+    padding: 8px;
+    text-align: left;
+}
+
+.zos_plus_icon {
+    font-size: 20px;
+}
+
+/* 手机里的设置页:黑底白字,配色跟手机走不跟酒馆主题 */
+.zos_settings_page {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 10px 12px 16px;
+    color: var(--zos-ink);
+    font-size: 12px;
+    line-height: 1.5;
+}
+
+.zos_settings_page hr {
+    border: 0;
+    border-top: 1px solid var(--zos-line);
+    margin: 12px 0;
+}
+
+.zos_settings_page .zos_hint {
+    color: var(--zos-ink-dim);
+    font-size: 11px;
+    margin: 3px 0;
+}
+
+.zos_settings_page .zos_bad {
+    color: #ff9b8a;
+}
+
+.zos_settings_page .zos_field {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    margin: 6px 0;
+}
+
+.zos_settings_page .zos_range {
+    flex-direction: row;
+    align-items: center;
+    gap: 5px;
+}
+
+.zos_settings_page .zos_range input {
+    width: 4em;
+}
+
+.zos_settings_page .text_pole,
+.zos_settings_page select {
+    width: 100%;
+    background-color: rgba(255, 255, 255, 0.08);
+    color: var(--zos-ink);
+    border: 1px solid var(--zos-line);
+    border-radius: 8px;
+    padding: 5px 8px;
+    font-size: 12px;
+    margin: 0;
+}
+
+.zos_settings_page option,
+.zos_settings_page optgroup {
+    background-color: #1c1c22;
+    color: var(--zos-ink);
+}
+
+.zos_settings_page .checkbox_label {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin: 6px 0;
+    color: var(--zos-ink);
+}
+
+.zos_settings_page .zos_buttons {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+    margin: 6px 0;
+}
+
+.zos_settings_page .menu_button {
+    background-color: var(--zos-blue);
+    color: #fff;
+    border: 0;
+    border-radius: 14px;
+    padding: 5px 12px;
+    font-size: 12px;
+    cursor: pointer;
+    margin: 0;
+}

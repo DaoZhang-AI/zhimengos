@@ -16,7 +16,9 @@ import { getContext } from '../../../st-context.js';
 import {
     saveSettingsDebounced, getRequestHeaders, characters, getThumbnailUrl, chat_metadata, saveMetadata,
     selectCharacterById, openCharacterChat, getPastCharacterChats, setActiveCharacter, setActiveGroup,
+    setExtensionPrompt, extension_prompt_types, extension_prompt_roles,
 } from '../../../../script.js';
+import { user_avatar } from '../../../personas.js';
 import { groups, openGroupById, openGroupChat } from '../../../group-chats.js';
 import { eventSource, event_types } from '../../../events.js';
 import { uploadFileAttachment } from '../../../chats.js';
@@ -24,14 +26,14 @@ import { ConnectionManagerRequestService } from '../../shared.js';
 // ⚠️ 这两个 import 后面的 ?v= 要跟着版本号一起改。
 // manifest 里的 ?v= 只管 index.js,管不到它 import 进来的文件,
 // 不带的话改了库文件浏览器还喂旧的那份。
-import { fuzzyAgo, fuzzyRange, displayTime } from './lib/fuzzy-time.js?v=0.13.0';
-import { maintain, buildMemoryText, describe, DEFAULTS as MEM_DEFAULTS } from './lib/rolling-summary.js?v=0.13.0';
+import { fuzzyAgo, fuzzyRange, displayTime } from './lib/fuzzy-time.js?v=0.14.0';
+import { maintain, buildMemoryText, describe, DEFAULTS as MEM_DEFAULTS } from './lib/rolling-summary.js?v=0.14.0';
 import { callGenericPopup, POPUP_TYPE } from '../../../popup.js';
 import { writeSecret, SECRET_KEYS } from '../../../secrets.js';
 import { uuidv4 } from '../../../utils.js';
 
 /** 跟 manifest.json 的 version 手动保持一致,靠这行在控制台辨认在跑哪一版 */
-const VERSION = '0.13.0';
+const VERSION = '0.14.0';
 
 /** 必须和仓库名、文件夹名一致,理由见织梦者里那段注释 */
 const MODULE_NAME = 'zhimengos';
@@ -75,6 +77,12 @@ const defaultSettings = {
      *  单独一条的理由(2026-08-21 道长):**有人聊天爱用 flash,聊天还行,写摘要爱瞎写。**
      *  聊天要的是语感,摘要要的是老实,这两件事本来就该允许用不同的模型。 */
     summaryConnId: '',
+    /** 她停手这么多秒之后对方才回。**允许连发好几条再等回复**(道长 9/17:不要强制一问一答) */
+    replyDelay: 3,
+    /** 手机里的线上聊天要不要进主线上下文(道长 9/17:这是最早定的需求,线上线下要联动) */
+    linkMain: true,
+    /** 进主线的是每个联系人最近多少条 */
+    linkCount: 20,
 };
 
 function getSettings() {
@@ -86,6 +94,9 @@ function getSettings() {
     if (!settings.models || typeof settings.models !== 'object') settings.models = {};
     // 补齐后来新增的键,老用户升级时不至于缺
     settings.memory = { ...MEM_DEFAULTS, ...(settings.memory || {}) };
+    for (const k of ['replyDelay', 'linkMain', 'linkCount']) {
+        if (!(k in settings)) settings[k] = defaultSettings[k];
+    }
     return settings;
 }
 
@@ -286,6 +297,8 @@ const APPS = [
     { id: 'live', name: '直播', icon: '📺', done: false },
     { id: 'contacts', name: '通讯录', icon: '👥', done: false },
     { id: 'wallet', name: '钱包', icon: '💰', done: false },
+    // 道长 9/17:API 设置那些整体挪进手机自己的设置里,别让人去扩展抽屉里翻
+    { id: 'settings', name: '设置', icon: '⚙️', done: true },
 ];
 
 /* ==========================================================================
@@ -878,13 +891,10 @@ function renderChatRoom() {
     const chat = contactById(openChatId);
     if (!chat) return renderChatList();
 
-    const bubbles = (chat.messages || []).map(m => `
-        <div class="zos_msg zos_msg_${m.from === 'me' ? 'me' : 'them'}">
-            <div class="zos_bubble">${escapeHtml(m.text)}</div>
-            <div class="zos_msg_time">${escapeHtml(displayTime(m.t))}</div>
-        </div>`).join('');
+    const bubbles = (chat.messages || []).map(m => renderBubble(m, chat)).join('');
 
     const empty = `<div class="zos_empty">还没有消息。<br>说点什么吧。</div>`;
+    const delay = Number(getSettings().replyDelay) || 0;
 
     return `
         <div class="zos_appbar">
@@ -893,9 +903,194 @@ function renderChatRoom() {
             <div class="zos_appbar_right"><div class="zos_more" title="联系人设置">⋯</div></div>
         </div>
         <div class="zos_msgs">${chat.messages?.length ? bubbles : empty}</div>
+        <div class="zos_plus_panel zos_hidden">
+            <div class="zos_plus_item" data-kind="sticker"><div class="zos_plus_icon">😊</div>表情</div>
+            <div class="zos_plus_item" data-kind="image"><div class="zos_plus_icon">🖼️</div>图片</div>
+            <div class="zos_plus_item" data-kind="gift"><div class="zos_plus_icon">🎁</div>送礼</div>
+            <div class="zos_plus_item" data-kind="location"><div class="zos_plus_icon">📍</div>位置</div>
+            <div class="zos_plus_item zos_plus_wide" data-kind="offline_during"><div class="zos_plus_icon">🎬</div>一键线下:补写发消息时他在干嘛</div>
+            <div class="zos_plus_item zos_plus_wide" data-kind="offline_after"><div class="zos_plus_icon">🚶</div>一键线下:接着最后一条往下写</div>
+        </div>
         <div class="zos_composer">
-            <input class="zos_input" type="text" placeholder="说点什么">
-            <div class="zos_send">发送</div>
+            <div class="zos_plus" title="表情、图片、送礼、位置、一键线下">+</div>
+            <input class="zos_input" type="text" placeholder="${delay ? `可以连发几条,停手 ${delay} 秒他才回` : '说点什么'}">
+            <div class="zos_send" title="输入框空着点一下 = 让他马上回">发送</div>
+        </div>`;
+}
+
+/** 消息里的特殊种类:发出去的是带方括号标记的文字,模型看得懂,界面上换成图标 */
+const KIND_MARKS = { sticker: '表情', image: '图片', gift: '礼物', location: '位置' };
+const KIND_ICONS = { 表情: '😊', 图片: '🖼️', 礼物: '🎁', 位置: '📍' };
+
+function kindOf(text) {
+    const m = String(text || '').match(/^\[(表情|图片|礼物|位置)\]\s*([\s\S]*)$/);
+    return m ? { mark: m[1], body: m[2] } : null;
+}
+
+/* ---------- 「+」菜单:表情、图片、送礼、位置、一键线下 ---------- */
+
+const PLUS_HINTS = {
+    sticker: '发个什么表情?比如:捂脸笑、翻白眼的猫',
+    image: '图片里是什么?比如:刚拍的晚霞、桌上那碗面',
+    gift: '送什么?比如:一杯奶茶、一束白玫瑰',
+    location: '发哪儿的位置?比如:老城区地铁站 B 口',
+};
+
+async function onPlusItem(kind) {
+    $('.zos_plus_panel').addClass('zos_hidden');
+    const contact = contactById(openChatId);
+    if (!contact) return;
+
+    if (kind === 'offline_during' || kind === 'offline_after') {
+        return goOffline(contact, kind === 'offline_during' ? 'during' : 'after');
+    }
+
+    // 都用文字代替:发出去是「[图片] 窗外在下雨」这样,模型看得懂,界面上画成卡片
+    const text = await callGenericPopup(`<div class="zos_popup">${escapeHtml(PLUS_HINTS[kind] || '')}</div>`,
+        POPUP_TYPE.INPUT, '', { okButton: '发送', cancelButton: '算了' });
+    if (!text || !String(text).trim()) return;
+    await pushMine(contact, `[${KIND_MARKS[kind]}] ${String(text).trim()}`);
+}
+
+/* ---------- 一键线下:按手机里这段聊天,让主线生成一层正文 ----------
+ *
+ * 道长 9/17 定的两种:
+ *   during = 补写发这些消息的时候,他那一头人在哪、在干嘛
+ *   after  = 以最后一条为起点,写他接下来做了什么
+ * 做法:把聊天和要求挂成一条一次性的注入(用户位、深度 0,末条还是用户),
+ * 让酒馆用主线的连接和预设正常生成一层,生成完就撤掉。走的是酒馆自己的生成,公益站看到的就是酒馆。
+ */
+const KEY_OFFLINE = 'zhimengos_offline';
+/** 主线正在生成。这时候点一键线下,那条注入会被上一轮的结束事件撤掉,所以直接拦住 */
+let mainGenerating = false;
+
+function contactRealName(contact) {
+    const card = characters.find(c => c.avatar === contact.avatarKey);
+    return card?.name || contact.nick || '对方';
+}
+
+function buildOfflinePrompt(contact, mode) {
+    const userName = getContext().name1 || '我';
+    const charName = contactRealName(contact);
+    const nick = contact.nick || charName;
+    const lines = (contact.messages || []).slice(-30)
+        .map(m => `[${displayTime(m.t)}] ${m.from === 'me' ? userName : nick}:${m.text}`);
+
+    const head = [
+        '[这一层写线下正文]',
+        `下面是${userName}和${charName}刚才在手机上的一段文字聊天(${charName}在手机上叫「${nick}」)。这段聊天已经真实发生过了。`,
+        '',
+        ...lines,
+        '',
+    ];
+
+    const ask = mode === 'during'
+        ? [
+            `这一层请写:发这些消息的那段时间里,${charName}那一头人在哪、在做什么、是什么神情和小动作。`,
+            '按消息的时间顺序写,可以写他拿起手机、打字、停下来、删了又重写、放下手机又拿起来。',
+            '消息原文照录,一个字不许改。',
+            '写到最后一条消息为止,不要往后推进剧情。',
+        ]
+        : [
+            `这一层请写:以最后一条消息为起点,${charName}接下来做了什么。`,
+            '聊天本身已经发生过了,不要在正文里重写或复述这段聊天。',
+        ];
+
+    return [...head, ...ask, `不要替${userName}做任何动作、说任何话。`].join(LF);
+}
+
+async function goOffline(contact, mode) {
+    if (!contact.messages?.length) {
+        toastr.info('这段聊天还是空的,没东西可以写成线下', '织梦OS');
+        return;
+    }
+    if (!currentChatKey()) {
+        toastr.warning('先在酒馆里打开一个聊天,线下正文要写进那一局', '织梦OS');
+        return;
+    }
+    if (mainGenerating) {
+        toastr.info('主线正在生成,等它写完再点', '织梦OS');
+        return;
+    }
+
+    const context = getContext();
+    setExtensionPrompt(KEY_OFFLINE, buildOfflinePrompt(contact, mode),
+        extension_prompt_types.IN_CHAT, 0, false, extension_prompt_roles.USER);
+    closePhone();
+
+    try {
+        await context.executeSlashCommandsWithOptions('/trigger await=true');
+    } catch (error) {
+        toastr.error('没生成出来:' + String(error?.message || error), '织梦OS');
+    } finally {
+        setExtensionPrompt(KEY_OFFLINE, '', extension_prompt_types.IN_CHAT, 0);
+    }
+}
+
+/* ---------- 线上线下联动:手机里的聊天进主线上下文 ----------
+ *
+ * 道长 9/17:这是最早定的需求(2026-08-17 第二条「双向可见」),之前一行没写,现在补上。
+ * 只进**这一局**的联系人(存在聊天元数据里的那些);常驻联系人跨局共用,进了会串到别的故事里。
+ * 设置里关掉就当场撤掉,不等下一轮。
+ */
+const KEY_LINK = 'zhimengos_link';
+
+function refreshLink() {
+    const settings = getSettings();
+    const clear = () => setExtensionPrompt(KEY_LINK, '', extension_prompt_types.IN_CHAT, 0);
+
+    if (!settings.linkMain || !currentChatKey()) return clear();
+
+    const now = Date.now();
+    const n = Math.max(1, Math.min(200, Number(settings.linkCount) || 20));
+    const userName = getContext().name1 || '我';
+    const blocks = [];
+
+    for (const c of localContacts) {
+        const recent = (c.messages || []).slice(-n);
+        if (!recent.length) continue;
+        const nick = c.nick || '对方';
+        const memory = buildMemoryText(c, (from, to) => fuzzyRange(from, to, now));
+        blocks.push([
+            `— 和「${nick}」:`,
+            memory ? `(更早的:${memory.replace(/\s*\n\s*/g, ' ')})` : '',
+            ...recent.map(m => `[${fuzzyAgo(m.t, now) || displayTime(m.t)}] ${m.from === 'me' ? userName : nick}:${m.text}`),
+        ].filter(Boolean).join(LF));
+    }
+
+    if (!blocks.length) return clear();
+
+    const text = [
+        '[手机上的线上聊天]',
+        `下面是${userName}在手机上和别人的文字聊天,都是真实发生过的事。`,
+        '聊天另一方记得自己在手机上说过什么,线下可以接着这些事往下走,也可以提起;没参与这段聊天的人不知道内容。',
+        '「」里是对方在手机上的名字。',
+        '',
+        ...blocks,
+    ].join(LF);
+
+    setExtensionPrompt(KEY_LINK, text, extension_prompt_types.IN_CHAT, 4, false, extension_prompt_roles.SYSTEM);
+}
+
+/** 两边头像常驻(道长 9/17):对方在左,自己在右 */
+function renderBubble(m, contact) {
+    const mine = m.from === 'me';
+    const src = mine ? (user_avatar ? getThumbnailUrl('persona', user_avatar) : '') : avatarOf(contact);
+    const fallback = mine ? '我' : (contact.nick || '?').slice(0, 1);
+    const avatar = `<div class="zos_msg_avatar">${src ? `<img src="${escapeHtml(src)}" alt="">` : escapeHtml(fallback)}</div>`;
+    const kind = kindOf(m.text);
+    const inner = kind
+        ? `<div class="zos_bubble zos_bubble_card"><span class="zos_card_icon">${KIND_ICONS[kind.mark]}</span><span><span class="zos_card_mark">${kind.mark}</span>${escapeHtml(kind.body)}</span></div>`
+        : `<div class="zos_bubble">${escapeHtml(m.text)}</div>`;
+
+    return `
+        <div class="zos_msg_row zos_msg_row_${mine ? 'me' : 'them'}">
+            ${mine ? '' : avatar}
+            <div class="zos_msg zos_msg_${mine ? 'me' : 'them'}">
+                ${inner}
+                <div class="zos_msg_time">${escapeHtml(displayTime(m.t))}</div>
+            </div>
+            ${mine ? avatar : ''}
         </div>`;
 }
 
@@ -990,9 +1185,13 @@ function renderScreen() {
     else if (screen === 'chat_list') body = renderChatList();
     else if (screen === 'chat_room') body = renderChatRoom();
     else if (screen === 'contact_edit') body = renderContactEdit();
+    else if (screen === 'settings') body = renderSettings();
 
     $('#zos_screen').html(body);
     $('#zos_phone').attr('data-screen', screen);
+
+    // 设置页里的下拉要按当前连接现填
+    if (screen === 'settings') renderConnectionOptions();
 }
 
 function goto(next, chatId = null) {
@@ -1052,6 +1251,7 @@ function buildPhone() {
         }
 
         if (app === 'chat') goto('chat_list');
+        if (app === 'settings') goto('settings');
     });
 
     $('#zos_screen').on('click', '.zos_chat_row[data-chat]', function () {
@@ -1791,6 +1991,9 @@ function buildPrompt(contact, count) {
         '不要写旁白、动作、心理描写,这是纯文字聊天。',
         '不要复述方括号里的时间,那只是给你参考用的。',
         '不要重复对方刚说过的话。',
+        '对方可能一口气连发了好几条,把这几条连起来看,一起回。',
+        '对方发来的 [表情] [图片] [礼物] [位置],就当你真的收到了、看到了。',
+        '你想发的话也可以,写成 <msg>[表情] 捂脸笑</msg>、<msg>[图片] 窗外在下雨</msg> 这样,方括号里只能是 表情、图片、礼物、位置 四种,偶尔用,别每次都用。',
         '除了 <msg> 之外不要输出任何别的东西。');
 
     // 保留窗口内的正文,更早的已经在摘要里了
@@ -1869,8 +2072,8 @@ function splitReply(text, limit) {
     const tagged = [...raw.matchAll(/<msg[^>]*>([\s\S]*?)<\/msg>/gi)].map(m => m[1]);
 
     const lines = (tagged.length ? tagged : raw.split(LF))
-        // 模型有时会把参考用的时间标记也抄进来,去掉
-        .map(line => String(line).replace(/^\[[^\]]*\]\s*/, '').trim())
+        // 模型有时会把参考用的时间标记也抄进来,去掉;[表情] [图片] 这类是消息种类,要留着
+        .map(line => String(line).replace(/^\[(?!(?:表情|图片|礼物|位置)\])[^\]]*\]\s*/, '').trim())
         // 没包住的残标签也清掉
         .map(line => line.replace(/<\/?msg[^>]*>/gi, '').trim())
         .filter(Boolean);
@@ -1897,14 +2100,9 @@ function typingDelayFor(text) {
     return Math.min(2600, Math.max(450, String(text || '').length * 90));
 }
 
-function appendBubble(message) {
-    const html = `
-        <div class="zos_msg zos_msg_them">
-            <div class="zos_bubble">${escapeHtml(message.text)}</div>
-            <div class="zos_msg_time">${escapeHtml(displayTime(message.t))}</div>
-        </div>`;
-
-    $('.zos_msgs').append(html);
+function appendBubble(message, contact) {
+    $('.zos_msgs .zos_empty').remove();
+    $('.zos_msgs').append(renderBubble(message, contact || contactById(openChatId) || {}));
     scrollMessagesToEnd();
 }
 
@@ -1913,33 +2111,80 @@ function scrollMessagesToEnd() {
     if (box) box.scrollTop = box.scrollHeight;
 }
 
+/** 正在等模型回的那个联系人。同一时间只跑一条生成 */
 let sending = false;
+/** 生成途中她又发了消息:这一轮回完再回一轮 */
+let replyAgain = null;
+/** 停手计时:她连发时每发一条就重新计时,停够 replyDelay 秒才让对方回 */
+let replyTimer = null;
 
+/**
+ * 发送只负责把她这条放进去(道长 9/17:允许连发好几条之后 AI 再回,不要强制一问一答)。
+ * 输入框空着点发送 = 不等了,让他马上回。
+ */
 async function onSend() {
-    if (sending) return;
-
     const contact = contactById(openChatId);
     const input = document.querySelector('.zos_input');
     const text = String(input?.value || '').trim();
 
-    if (!contact || !text) return;
+    if (!contact) return;
+
+    if (!text) {
+        // 空着点发送:有她没回的消息就立刻让对方回
+        const last = contact.messages?.[contact.messages.length - 1];
+        if (last?.from === 'me') {
+            clearTimeout(replyTimer);
+            requestReply(contact.id);
+        }
+        return;
+    }
+
+    input.value = '';
+    await pushMine(contact, text);
+}
+
+/** 把她发的一条(文字或者表情、图片这些)放进去、存盘、开始停手计时 */
+async function pushMine(contact, text) {
+    const chatKey = currentChatKey();
+    if (!Array.isArray(contact.messages)) contact.messages = [];
+    const message = { from: 'me', text, t: Date.now() };
+    contact.messages.push(message);
+
+    if (screen === 'chat_room' && openChatId === contact.id) appendBubble(message, contact);
+    await saveContactFrom(contact, chatKey);
+    refreshLink();
+
+    scheduleReply(contact.id);
+}
+
+function scheduleReply(contactId) {
+    clearTimeout(replyTimer);
+    const delay = Math.max(0, Number(getSettings().replyDelay) || 0) * 1000;
+    replyTimer = setTimeout(() => requestReply(contactId), delay);
+}
+
+/** 让对方回。正在回别的就记下来,回完再补一轮 */
+async function requestReply(contactId) {
+    if (sending) {
+        replyAgain = contactId;
+        return;
+    }
+
+    const contact = contactById(contactId);
+    if (!contact) return;
+    // 最后一条已经是对方说的,就没什么要回的
+    if (contact.messages?.[contact.messages.length - 1]?.from !== 'me') return;
 
     sending = true;
-    input.value = '';
 
     // 记下是在哪一局发的。等回复那几秒她可能切走,回复得回到这一局去
     const chatKey = currentChatKey();
 
-    if (!Array.isArray(contact.messages)) contact.messages = [];
-    contact.messages.push({ from: 'me', text, t: Date.now() });
-
-    renderScreen();
-    scrollMessagesToEnd();
-    await saveContactFrom(contact, chatKey);
-
     // 等回复时给个"正在输入",不然按下去像没反应
-    $('.zos_msgs').append('<div class="zos_typing">正在输入...</div>');
-    scrollMessagesToEnd();
+    if (screen === 'chat_room' && openChatId === contact.id) {
+        $('.zos_msgs').append('<div class="zos_typing">正在输入...</div>');
+        scrollMessagesToEnd();
+    }
 
     const count = pickReplyCount();
 
@@ -1955,15 +2200,24 @@ async function onSend() {
         // 存完再维护。**维护会动正文,所以必须在正文已经落盘之后**。
         // 切走了就不维护:正文还寄存着没落盘,这时候压缩等于拿没存的东西去删东西
         if (currentChatKey() === chatKey || isGlobal(contact.id)) await runMaintain(contact, chatKey);
+        refreshLink();
     } catch (error) {
-        renderScreen();
+        $('.zos_typing').remove();
+        if (screen === 'chat_room') renderScreen();
         await callGenericPopup(
-            `<div class="zos_popup"><div class="zos_bad">没发出去。</div>
+            `<div class="zos_popup"><div class="zos_bad">对方没回上。</div>
             <div class="zos_hint">原话:</div>
-            <div class="zos_reason">${escapeHtml(String(error?.message || error))}</div></div>`,
+            <div class="zos_reason">${escapeHtml(String(error?.message || error))}</div>
+            <div class="zos_hint">你的消息已经存好了。输入框空着再点一次发送,就会重新让他回。</div></div>`,
             POPUP_TYPE.TEXT, '', { okButton: '知道了', wide: true });
     } finally {
         sending = false;
+        // 回的途中她又发了:再回一轮
+        if (replyAgain) {
+            const next = replyAgain;
+            replyAgain = null;
+            scheduleReply(next);
+        }
     }
 }
 
@@ -1986,7 +2240,7 @@ async function deliver(contact, lines, chatKey) {
         const stillHere = screen === 'chat_room' && openChatId === contact.id;
 
         if (!animate) continue;
-        if (stillHere) appendBubble(message);
+        if (stillHere) appendBubble(message, contact);
 
         if (i < lines.length - 1) {
             if (stillHere) {
@@ -2196,8 +2450,40 @@ function renderSummaryConnOptions(conns) {
     $('#zos_sum_conn').html(parts.join(''));
 }
 
-/** 选中一条之后下面那块:地址、模型、以及不能用时的原因 */
-function renderConnectionDetail() {
+/** 拉过的模型列表存在这台设备的 localStorage 里(几十个名字,不进 settings.json),下次打开设置页还在 */
+const MODEL_CACHE_KEY = 'zhimengos-model-lists';
+
+function readModelCache() {
+    try {
+        const data = JSON.parse(localStorage.getItem(MODEL_CACHE_KEY) || '{}');
+        return data && typeof data === 'object' ? data : {};
+    } catch {
+        return {};
+    }
+}
+
+function writeModelCache(connId, models) {
+    try {
+        localStorage.setItem(MODEL_CACHE_KEY, JSON.stringify({ ...readModelCache(), [connId]: models }));
+    } catch { /* 隐私模式之类的写不进去,下次再拉就是 */ }
+}
+
+function fillModelSelect(models, current) {
+    const list = [...new Set([...(models || []), current].filter(Boolean))];
+    if (!list.length) {
+        $('#zos_model').html('<option value="">还没加载</option>').val('');
+        return;
+    }
+    $('#zos_model').html(list.map(m => `<option value="${escapeHtml(m)}">${escapeHtml(m)}</option>`).join(''))
+        .val(current && list.includes(current) ? current : '');
+    $('#zos_model_count').text(models?.length ? `列表里有 ${models.length} 个模型` : '');
+}
+
+/**
+ * 选中一条之后下面那块:地址、模型、以及不能用时的原因。
+ * keepList = 只是换了个模型,下拉列表别动(9/17 的 bug:拉到几十个,选完一个列表只剩一个,就是这里每次都清空)
+ */
+function renderConnectionDetail(keepList = false) {
     const conn = findConnection(getSettings().connId);
 
     if (!conn) {
@@ -2220,8 +2506,9 @@ function renderConnectionDetail() {
 
     $('#zos_model_row').show();
 
-    // 每换一条连接就把模型下拉清空,免得把上一条的模型看成这一条的
-    $('#zos_model').html(`<option value="">${model ? escapeHtml(model) : '还没加载'}</option>`).val('');
+    if (keepList) return;
+    // 换了连接:列表换成这一条自己拉过的那份,没拉过就只放当前模型
+    fillModelSelect(readModelCache()[conn.id] || [], model);
 }
 
 async function onLoadModels() {
@@ -2242,14 +2529,12 @@ async function onLoadModels() {
         }
 
         const current = currentModelOf(conn);
-        const options = models.map(m =>
-            `<option value="${escapeHtml(m)}" ${m === current ? 'selected' : ''}>${escapeHtml(m)}</option>`);
+        writeModelCache(conn.id, models);
+        fillModelSelect(models, current);
+        // 当前模型不在列表里才替她挑第一个
+        if (!current || !models.includes(current)) $('#zos_model').val(models[0]).trigger('change');
 
-        $('#zos_model').html(options.join(''))
-            .val(current && models.includes(current) ? current : models[0])
-            .trigger('change');
-
-        $('#zos_model_count').text(`拉到 ${models.length} 个模型`);
+        $('#zos_model_count').text(`拉到 ${models.length} 个模型,在上面下拉里选`);
     } catch (error) {
         await callGenericPopup(
             `<div class="zos_popup"><div class="zos_bad">拉不到模型列表。</div>
@@ -2271,7 +2556,7 @@ function onPickModel() {
 
     settings.models[conn.id] = model;
     saveSettingsDebounced();
-    renderConnectionDetail();
+    renderConnectionDetail(true);
 }
 
 function onTypeModel() {
@@ -2289,7 +2574,8 @@ function onTypeModel() {
 
     saveSettingsDebounced();
     $('#zos_model_manual').val('');
-    renderConnectionDetail();
+    renderConnectionDetail(true);
+    fillModelSelect(readModelCache()[conn.id] || [], currentModelOf(conn));
 }
 
 async function onAddProfile() {
@@ -2350,43 +2636,17 @@ async function onAddProfile() {
     }
 }
 
-function renderPanel() {
+/** 手机里的 ⚙️ 设置页(道长 9/17:API 设置整体挪进手机自己的设置里)。
+ *  元素 id 沿用原来抽屉里的,事件都委托在 document 上,所以每次重画不用重绑 */
+function renderSettings() {
     const settings = getSettings();
-
-    const html = `
-    <div id="zos_settings">
-        <div class="inline-drawer">
-            <div class="inline-drawer-toggle inline-drawer-header">
-                <b>📱 织梦OS</b>
-                <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
-            </div>
-            <div class="inline-drawer-content">
-
-                <div class="zos_hint">当前版本 v${VERSION}</div>
-                <div class="zos_buttons">
-                    <div id="zos_self_check" class="menu_button">查看更新</div>
-                </div>
-                <div id="zos_self_out"></div>
-
-                <hr>
-                <b>入口</b>
-                <div class="zos_buttons">
-                    <div id="zos_open" class="menu_button">打开手机</div>
-                </div>
-                <label class="checkbox_label">
-                    <input id="zos_ball_hidden" type="checkbox" ${settings.ballHidden ? 'checked' : ''}>
-                    <span>把悬浮的手机图标藏起来</span>
-                </label>
-                <label class="checkbox_label">
-                    <input id="zos_ball_preview" type="checkbox">
-                    <span>预览「有新消息」的样子</span>
-                </label>
-                <div class="zos_hint">图标可以拖,位置会记住。藏起来之后用上面那个按钮照样能开。
-                    两张图分别是 <code>assets/phone.png</code>(平时)和 <code>assets/phone-new.png</code>(有新消息),
-                    想换自己替掉就行,文件不在会退回画出来的图标加一个小红点。
-                    <b>预览那个开关只是给你看效果的</b>,真消息接上之后会自动切。</div>
-
-                <hr>
+    return `
+        <div class="zos_appbar">
+            <div class="zos_back" data-to="home">‹</div>
+            <div class="zos_appbar_title">设置</div>
+            <div class="zos_appbar_right"></div>
+        </div>
+        <div class="zos_settings_page">
                 <b>手机用哪个连接</b>
                 <div class="zos_hint">手机可以用和主线不同的模型,回一条消息不需要好模型,便宜的就够。
                     下面列的是<b>你已经有的连接</b>,酒馆自带的和 API 管理器里的都在,分组显示。
@@ -2432,6 +2692,25 @@ function renderPanel() {
                 <div class="zos_hint">关掉的话几条一起出来。<b>不管开不开,每条都是当场存好的</b>,
                     演到一半刷新或者切走都不会丢。</div>
 
+                <label class="zos_field">
+                    <span>停手几秒后对方才回</span>
+                    <input id="zos_reply_delay" type="number" min="0" max="60" class="text_pole" value="${settings.replyDelay}">
+                </label>
+                <div class="zos_hint">可以一口气连发好几条,停手这么多秒他才回。填 0 就是发一条回一条。
+                    输入框空着点「发送」= 不等了,让他马上回。</div>
+
+                <hr>
+                <b>线上线下联动</b>
+                <label class="checkbox_label">
+                    <input id="zos_link_main" type="checkbox" ${settings.linkMain ? 'checked' : ''}>
+                    <span>手机里的聊天进主线上下文</span>
+                </label>
+                <label class="zos_field">
+                    <span>每个联系人带最近几条</span>
+                    <input id="zos_link_count" type="number" min="1" max="200" class="text_pole" value="${settings.linkCount}">
+                </label>
+                <div class="zos_hint">开着的话,主线每次生成都能看到这一局手机里聊过什么,线下能接住线上的事。
+                    只带<b>这一局</b>的联系人;常驻联系人跨局共用,不进主线,免得串到别的故事里。</div>
                 <hr>
                 <b>记忆</b>
                 <div class="zos_hint">聊天记录不会被丢掉,而是<b>攒够一批就压成一段摘要</b>,
@@ -2494,6 +2773,47 @@ function renderPanel() {
 
                 <div class="zos_hint zos_bad">这里<b>不做连通性测试</b>。
                     探测性的请求会让公益站把你拉黑,所以能不能用请你自己判断。</div>
+        </div>`;
+}
+
+function renderPanel() {
+    const settings = getSettings();
+
+    const html = `
+    <div id="zos_settings">
+        <div class="inline-drawer">
+            <div class="inline-drawer-toggle inline-drawer-header">
+                <b>📱 织梦OS</b>
+                <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+            </div>
+            <div class="inline-drawer-content">
+
+                <div class="zos_hint">当前版本 v${VERSION}</div>
+                <div class="zos_buttons">
+                    <div id="zos_self_check" class="menu_button">查看更新</div>
+                </div>
+                <div id="zos_self_out"></div>
+
+                <hr>
+                <b>入口</b>
+                <div class="zos_buttons">
+                    <div id="zos_open" class="menu_button">打开手机</div>
+                </div>
+                <label class="checkbox_label">
+                    <input id="zos_ball_hidden" type="checkbox" ${settings.ballHidden ? 'checked' : ''}>
+                    <span>把悬浮的手机图标藏起来</span>
+                </label>
+                <label class="checkbox_label">
+                    <input id="zos_ball_preview" type="checkbox">
+                    <span>预览「有新消息」的样子</span>
+                </label>
+                <div class="zos_hint">图标可以拖,位置会记住。藏起来之后用上面那个按钮照样能开。
+                    两张图分别是 <code>assets/phone.png</code>(平时)和 <code>assets/phone-new.png</code>(有新消息),
+                    想换自己替掉就行,文件不在会退回画出来的图标加一个小红点。
+                    <b>预览那个开关只是给你看效果的</b>,真消息接上之后会自动切。</div>
+
+                <hr>
+                <div class="zos_hint">连接、模型、回复条数、记忆这些设置都搬进手机里了:打开手机,点 ⚙️ 设置。</div>
             </div>
         </div>
     </div>`;
@@ -2503,7 +2823,7 @@ function renderPanel() {
     $('#zos_open').on('click', () => togglePhone());
     $('#zos_self_check').on('click', () => checkSelfUpdate());
 
-    $('#zos_keep_raw, #zos_batch_size, #zos_compact_after').on('input', function () {
+    $(document).on('input', '#zos_keep_raw, #zos_batch_size, #zos_compact_after', function () {
         const map = { zos_keep_raw: 'keepRaw', zos_batch_size: 'batchSize', zos_compact_after: 'compactAfter' };
         const key = map[this.id];
         const value = Number($(this).val());
@@ -2527,14 +2847,14 @@ function renderPanel() {
         setBallUnread(Boolean($(this).prop('checked')));
     });
 
-    $('#zos_conn').on('change', function () {
+    $(document).on('change', '#zos_conn', function () {
         getSettings().connId = String($(this).val() || '');
         saveSettingsDebounced();
         renderConnectionDetail();
         $('#zos_model_count').text('');
     });
 
-    $('#zos_reply_min, #zos_reply_max').on('input', function () {
+    $(document).on('input', '#zos_reply_min, #zos_reply_max', function () {
         const key = this.id === 'zos_reply_min' ? 'replyMin' : 'replyMax';
         const value = Number($(this).val());
 
@@ -2545,26 +2865,51 @@ function renderPanel() {
         saveSettingsDebounced();
     });
 
-    $('#zos_typing').on('input', function () {
+    $(document).on('input', '#zos_typing', function () {
         getSettings().typing = Boolean($(this).prop('checked'));
         saveSettingsDebounced();
     });
 
-    $('#zos_sum_conn').on('change', function () {
+    $(document).on('change', '#zos_sum_conn', function () {
         getSettings().summaryConnId = String($(this).val() || '');
         saveSettingsDebounced();
     });
 
-    $('#zos_model').on('change', () => onPickModel());
-    $('#zos_load_models').on('click', () => onLoadModels());
-    $('#zos_add_profile').on('click', () => onAddProfile());
+    $(document).on('change', '#zos_model', () => onPickModel());
+    $(document).on('click', '#zos_load_models', () => onLoadModels());
+    $(document).on('click', '#zos_add_profile', () => onAddProfile());
 
-    $('#zos_model_manual').on('keydown', function (event) {
+    $(document).on('keydown', '#zos_model_manual', function (event) {
         if (event.key === 'Enter') {
             event.preventDefault();
             onTypeModel();
         }
     });
+
+    $(document).on('input', '#zos_reply_delay', function () {
+        const value = Number($(this).val());
+        if (!Number.isFinite(value) || value < 0) return;
+        getSettings().replyDelay = Math.min(60, Math.round(value));
+        saveSettingsDebounced();
+    });
+
+    // 联动开关:关掉当场撤掉注入,不等下一轮
+    $(document).on('input', '#zos_link_main', function () {
+        getSettings().linkMain = Boolean($(this).prop('checked'));
+        saveSettingsDebounced();
+        refreshLink();
+    });
+    $(document).on('input', '#zos_link_count', function () {
+        const value = Number($(this).val());
+        if (!Number.isFinite(value) || value <= 0) return;
+        getSettings().linkCount = Math.min(200, Math.round(value));
+        saveSettingsDebounced();
+        refreshLink();
+    });
+
+    // 「+」菜单
+    $(document).on('click', '#zos_screen .zos_plus', () => $('.zos_plus_panel').toggleClass('zos_hidden'));
+    $(document).on('click', '#zos_screen .zos_plus_item', function () { onPlusItem(String($(this).data('kind'))); });
 
     renderConnectionOptions();
 }
@@ -2578,6 +2923,9 @@ jQuery(async () => {
     // 从收藏夹跳过来的例外:那是在手机里点的,跳完要留在手机里看那一局
     eventSource.on(event_types.CHAT_CHANGED, () => {
         loadLocal();
+        // 换了一局,主线上下文里的手机聊天也跟着换
+        refreshLink();
+        clearTimeout(replyTimer);
         if (jumping) return;
         if (!$('#zos_phone_wrap').hasClass('zos_hidden')) closePhone();
     });
@@ -2599,7 +2947,17 @@ jQuery(async () => {
         if (changed) await saveFavorites();
     });
 
+    // 一键线下那条注入只该活一轮:生成结束或者被停掉都撤掉,防着 /trigger 半路出错没走到 finally
+    const dropOffline = () => {
+        mainGenerating = false;
+        setExtensionPrompt(KEY_OFFLINE, '', extension_prompt_types.IN_CHAT, 0);
+    };
+    eventSource.on(event_types.GENERATION_STARTED, (_type, _opts, dryRun) => { if (!dryRun) mainGenerating = true; });
+    eventSource.on(event_types.GENERATION_ENDED, dropOffline);
+    eventSource.on(event_types.GENERATION_STOPPED, dropOffline);
+
     loadLocal();
+    refreshLink();
     loadFavorites();
 
     if (!isConnectionManagerAvailable()) {
