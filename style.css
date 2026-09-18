@@ -1136,6 +1136,10 @@
 }
 
 .zos_settings_page .menu_button {
+    /* 酒馆自己的 .menu_button 是 width: min-content,中文会一个字一行竖下来(道长 9/18 截图) */
+    width: auto;
+    white-space: nowrap;
+    flex: 0 0 auto;
     background-color: var(--zos-blue);
     color: #fff;
     border: 0;

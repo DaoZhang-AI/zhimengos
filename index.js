@@ -26,14 +26,14 @@ import { ConnectionManagerRequestService } from '../../shared.js';
 // ⚠️ 这两个 import 后面的 ?v= 要跟着版本号一起改。
 // manifest 里的 ?v= 只管 index.js,管不到它 import 进来的文件,
 // 不带的话改了库文件浏览器还喂旧的那份。
-import { fuzzyAgo, fuzzyRange, displayTime } from './lib/fuzzy-time.js?v=0.14.3';
-import { maintain, buildMemoryText, describe, DEFAULTS as MEM_DEFAULTS } from './lib/rolling-summary.js?v=0.14.3';
+import { fuzzyAgo, fuzzyRange, displayTime } from './lib/fuzzy-time.js?v=0.14.4';
+import { maintain, buildMemoryText, describe, DEFAULTS as MEM_DEFAULTS } from './lib/rolling-summary.js?v=0.14.4';
 import { callGenericPopup, POPUP_TYPE } from '../../../popup.js';
 import { writeSecret, SECRET_KEYS } from '../../../secrets.js';
 import { uuidv4 } from '../../../utils.js';
 
 /** 跟 manifest.json 的 version 手动保持一致,靠这行在控制台辨认在跑哪一版 */
-const VERSION = '0.14.3';
+const VERSION = '0.14.4';
 
 /** 必须和仓库名、文件夹名一致,理由见织梦者里那段注释 */
 const MODULE_NAME = 'zhimengos';
