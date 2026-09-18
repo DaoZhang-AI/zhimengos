@@ -26,14 +26,14 @@ import { ConnectionManagerRequestService } from '../../shared.js';
 // ⚠️ 这两个 import 后面的 ?v= 要跟着版本号一起改。
 // manifest 里的 ?v= 只管 index.js,管不到它 import 进来的文件,
 // 不带的话改了库文件浏览器还喂旧的那份。
-import { fuzzyAgo, fuzzyRange, displayTime } from './lib/fuzzy-time.js?v=0.14.4';
-import { maintain, buildMemoryText, describe, DEFAULTS as MEM_DEFAULTS } from './lib/rolling-summary.js?v=0.14.4';
+import { fuzzyAgo, fuzzyRange, displayTime } from './lib/fuzzy-time.js?v=0.15.0';
+import { maintain, buildMemoryText, describe, DEFAULTS as MEM_DEFAULTS } from './lib/rolling-summary.js?v=0.15.0';
 import { callGenericPopup, POPUP_TYPE } from '../../../popup.js';
 import { writeSecret, SECRET_KEYS } from '../../../secrets.js';
 import { uuidv4 } from '../../../utils.js';
 
 /** 跟 manifest.json 的 version 手动保持一致,靠这行在控制台辨认在跑哪一版 */
-const VERSION = '0.14.4';
+const VERSION = '0.15.0';
 
 /** 必须和仓库名、文件夹名一致,理由见织梦者里那段注释 */
 const MODULE_NAME = 'zhimengos';
@@ -958,11 +958,11 @@ async function onPlusItem(kind) {
  * 道长 9/17 定的两种:
  *   during = 补写发这些消息的时候,他那一头人在哪、在干嘛
  *   after  = 以最后一条为起点,写他接下来做了什么
- * 做法:把聊天和要求挂成一条一次性的注入(用户位、深度 0,末条还是用户),
- * 让酒馆用主线的连接和预设正常生成一层,生成完就撤掉。走的是酒馆自己的生成,公益站看到的就是酒馆。
+ * 做法(道长 9/18 改的):以用户名义留一条短的(「发完消息后，他……」),聊天里看着不乱;
+ * 完整的聊天记录和要求存在这条的 extra 里,由 zos_interceptor 在发出去的副本里换上。
+ * 然后 /trigger,酒馆用主线的连接和预设正常生成一层,公益站看到的就是酒馆。
  */
-const KEY_OFFLINE = 'zhimengos_offline';
-/** 主线正在生成。这时候点一键线下,那条注入会被上一轮的结束事件撤掉,所以直接拦住 */
+/** 主线正在生成。这时候点一键线下,/trigger 会被酒馆拒掉,所以直接拦住 */
 let mainGenerating = false;
 
 function contactRealName(contact) {
@@ -1015,18 +1015,54 @@ async function goOffline(contact, mode) {
     }
 
     const context = getContext();
-    setExtensionPrompt(KEY_OFFLINE, buildOfflinePrompt(contact, mode),
-        extension_prompt_types.IN_CHAT, 0, false, extension_prompt_roles.USER);
     closePhone();
 
     try {
+        // 道长 9/18:以用户的名义留一条短的,聊天里看着不乱;模型看到的是完整要求,
+        // 由 zos_interceptor 在发出去的副本里换掉,聊天文件里存的一直是这句短的
+        await context.executeSlashCommandsWithOptions(`/send ${OFFLINE_SHOWN[mode]}`);
+        const msg = context.chat[context.chat.length - 1];
+        if (!msg?.is_user) throw new Error('那条消息没发出去');
+        msg.extra = { ...(msg.extra || {}), zos_offline: { full: buildOfflinePrompt(contact, mode), brief: buildOfflineBrief(contact) } };
+        await context.saveChat();
+
         await context.executeSlashCommandsWithOptions('/trigger await=true');
     } catch (error) {
         toastr.error('没生成出来:' + String(error?.message || error), '织梦OS');
-    } finally {
-        setExtensionPrompt(KEY_OFFLINE, '', extension_prompt_types.IN_CHAT, 0);
     }
 }
+
+/** 聊天里看得到的那一句(道长给的原话) */
+const OFFLINE_SHOWN = {
+    during: '在给你发消息的同时他……',
+    after: '发完消息后，他……',
+};
+
+/** 这一层过去以后,再往后的生成里这条换成这个:只留聊天记录,不再带"这一层请写"那些要求 */
+function buildOfflineBrief(contact) {
+    const userName = getContext().name1 || '我';
+    const charName = contactRealName(contact);
+    const nick = contact.nick || charName;
+    const lines = (contact.messages || []).slice(-30)
+        .map(m => `[${displayTime(m.t)}] ${m.from === 'me' ? userName : nick}:${m.text}`);
+    return [`[这时${userName}和${charName}在手机上聊了这些(${charName}在手机上叫「${nick}」)]`, ...lines].join(LF);
+}
+
+/**
+ * 生成拦截器(manifest.json 的 generate_interceptor)。chat 是酒馆现造的副本,改 mes 不伤聊天文件。
+ * 一键线下留的那条:正在回它的这一轮(包括重 roll)换成完整要求,之后的轮换成只有聊天记录的短版。
+ */
+globalThis.zos_interceptor = async function (chat, _contextSize, _abort, type) {
+    if (type === 'quiet' || !Array.isArray(chat)) return;
+    let lastUser = -1;
+    for (let i = chat.length - 1; i >= 0; i--) {
+        if (chat[i]?.is_user) { lastUser = i; break; }
+    }
+    for (let i = 0; i < chat.length; i++) {
+        const o = chat[i]?.extra?.zos_offline;
+        if (o) chat[i].mes = i === lastUser ? o.full : o.brief;
+    }
+};
 
 /* ---------- 线上线下联动:手机里的聊天进主线上下文 ----------
  *
@@ -2907,10 +2943,7 @@ jQuery(async () => {
     });
 
     // 一键线下那条注入只该活一轮:生成结束或者被停掉都撤掉,防着 /trigger 半路出错没走到 finally
-    const dropOffline = () => {
-        mainGenerating = false;
-        setExtensionPrompt(KEY_OFFLINE, '', extension_prompt_types.IN_CHAT, 0);
-    };
+    const dropOffline = () => { mainGenerating = false; };
     eventSource.on(event_types.GENERATION_STARTED, (_type, _opts, dryRun) => { if (!dryRun) mainGenerating = true; });
     eventSource.on(event_types.GENERATION_ENDED, dropOffline);
     eventSource.on(event_types.GENERATION_STOPPED, dropOffline);
