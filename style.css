@@ -1114,6 +1114,19 @@
     margin: 0;
 }
 
+/* 酒馆自己的 .text_pole 会把字压暗,手机黑底上几乎看不见(9/18),钉死 */
+.zos_settings_page .text_pole,
+.zos_settings_page select,
+.zos_settings_page input {
+    color: var(--zos-ink) !important;
+    opacity: 1 !important;
+    filter: none !important;
+}
+
+.zos_settings_page input::placeholder {
+    color: var(--zos-ink-dim) !important;
+}
+
 .zos_settings_page option,
 .zos_settings_page optgroup {
     background-color: #1c1c22;

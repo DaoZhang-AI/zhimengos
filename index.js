@@ -26,14 +26,14 @@ import { ConnectionManagerRequestService } from '../../shared.js';
 // ⚠️ 这两个 import 后面的 ?v= 要跟着版本号一起改。
 // manifest 里的 ?v= 只管 index.js,管不到它 import 进来的文件,
 // 不带的话改了库文件浏览器还喂旧的那份。
-import { fuzzyAgo, fuzzyRange, displayTime } from './lib/fuzzy-time.js?v=0.15.0';
-import { maintain, buildMemoryText, describe, DEFAULTS as MEM_DEFAULTS } from './lib/rolling-summary.js?v=0.15.0';
+import { fuzzyAgo, fuzzyRange, displayTime } from './lib/fuzzy-time.js?v=0.15.1';
+import { maintain, buildMemoryText, describe, DEFAULTS as MEM_DEFAULTS } from './lib/rolling-summary.js?v=0.15.1';
 import { callGenericPopup, POPUP_TYPE } from '../../../popup.js';
 import { writeSecret, SECRET_KEYS } from '../../../secrets.js';
 import { uuidv4 } from '../../../utils.js';
 
 /** 跟 manifest.json 的 version 手动保持一致,靠这行在控制台辨认在跑哪一版 */
-const VERSION = '0.15.0';
+const VERSION = '0.15.1';
 
 /** 必须和仓库名、文件夹名一致,理由见织梦者里那段注释 */
 const MODULE_NAME = 'zhimengos';
@@ -73,8 +73,6 @@ const defaultSettings = {
     replyMax: 4,
     /** 回复一条一条往外冒,像真人在打字。嫌慢的人可以关掉 */
     typing: true,
-    /** 她停手这么多秒之后对方才回。**允许连发好几条再等回复**(道长 9/17:不要强制一问一答) */
-    replyDelay: 3,
     /** 手机里的线上聊天要不要进主线上下文(道长 9/17:这是最早定的需求,线上线下要联动) */
     linkMain: true,
 };
@@ -95,7 +93,7 @@ function getSettings() {
     }
     settings.memory.compactAfter = MEM_DEFAULTS.compactAfter;
     settings.memory.compactBatch = MEM_DEFAULTS.compactBatch;
-    for (const k of ['replyDelay', 'linkMain']) {
+    for (const k of ['linkMain']) {
         if (!(k in settings)) settings[k] = defaultSettings[k];
     }
     return settings;
@@ -895,7 +893,6 @@ function renderChatRoom() {
     const bubbles = (chat.messages || []).map(m => renderBubble(m, chat)).join('');
 
     const empty = `<div class="zos_empty">还没有消息。<br>说点什么吧。</div>`;
-    const delay = Number(getSettings().replyDelay) || 0;
 
     return `
         <div class="zos_appbar">
@@ -914,8 +911,8 @@ function renderChatRoom() {
         </div>
         <div class="zos_composer">
             <div class="zos_plus" title="表情、图片、送礼、位置、一键线下">+</div>
-            <input class="zos_input" type="text" placeholder="${delay ? `可以连发几条,停手 ${delay} 秒他才回` : '说点什么'}">
-            <div class="zos_send" title="输入框空着点一下 = 让他马上回">发送</div>
+            <input class="zos_input" type="text" placeholder="回车只发出去,点「发送」他才回">
+            <div class="zos_send" title="点一下让他回;输入框里有字会先发出去">发送</div>
         </div>`;
 }
 
@@ -1310,10 +1307,11 @@ function buildPhone() {
     });
 
     $('#zos_screen').on('click', '.zos_send', () => onSend());
+    // 道长 9/18:回车只发出去、不叫他回;点「发送」按钮才让他回。3 秒自动回太短,改成她自己说了算
     $('#zos_screen').on('keydown', '.zos_input', function (event) {
-        if (event.key === 'Enter') {
+        if (event.key === 'Enter' && !event.isComposing) {
             event.preventDefault();
-            onSend();
+            onSend(false);
         }
     });
 
@@ -2152,35 +2150,30 @@ function scrollMessagesToEnd() {
 let sending = false;
 /** 生成途中她又发了消息:这一轮回完再回一轮 */
 let replyAgain = null;
-/** 停手计时:她连发时每发一条就重新计时,停够 replyDelay 秒才让对方回 */
-let replyTimer = null;
 
 /**
- * 发送只负责把她这条放进去(道长 9/17:允许连发好几条之后 AI 再回,不要强制一问一答)。
- * 输入框空着点发送 = 不等了,让他马上回。
+ * 允许连发好几条之后 AI 再回,不要强制一问一答(道长 9/17)。
+ * 回车 = 只发出去;点「发送」按钮 = 有字先发出去,然后让他回(道长 9/18,原来停手 3 秒自动回太短)。
  */
-async function onSend() {
+async function onSend(askReply = true) {
     const contact = contactById(openChatId);
     const input = document.querySelector('.zos_input');
     const text = String(input?.value || '').trim();
 
     if (!contact) return;
 
-    if (!text) {
-        // 空着点发送:有她没回的消息就立刻让对方回
-        const last = contact.messages?.[contact.messages.length - 1];
-        if (last?.from === 'me') {
-            clearTimeout(replyTimer);
-            requestReply(contact.id);
-        }
-        return;
+    if (text) {
+        input.value = '';
+        await pushMine(contact, text);
     }
 
-    input.value = '';
-    await pushMine(contact, text);
+    // 回车只发不回;点按钮才让他回(输入框里有字就先发出去再叫他回)
+    if (!askReply) return;
+    const last = contact.messages?.[contact.messages.length - 1];
+    if (last?.from === 'me') requestReply(contact.id);
 }
 
-/** 把她发的一条(文字或者表情、图片这些)放进去、存盘、开始停手计时 */
+/** 把她发的一条(文字或者表情、图片这些)放进去、存盘。不叫他回,叫他回是发送按钮的事 */
 async function pushMine(contact, text) {
     const chatKey = currentChatKey();
     if (!Array.isArray(contact.messages)) contact.messages = [];
@@ -2190,14 +2183,6 @@ async function pushMine(contact, text) {
     if (screen === 'chat_room' && openChatId === contact.id) appendBubble(message, contact);
     await saveContactFrom(contact, chatKey);
     refreshLink();
-
-    scheduleReply(contact.id);
-}
-
-function scheduleReply(contactId) {
-    clearTimeout(replyTimer);
-    const delay = Math.max(0, Number(getSettings().replyDelay) || 0) * 1000;
-    replyTimer = setTimeout(() => requestReply(contactId), delay);
 }
 
 /** 让对方回。正在回别的就记下来,回完再补一轮 */
@@ -2253,7 +2238,7 @@ async function requestReply(contactId) {
         if (replyAgain) {
             const next = replyAgain;
             replyAgain = null;
-            scheduleReply(next);
+            requestReply(next);
         }
     }
 }
@@ -2711,12 +2696,6 @@ function renderSettings() {
                 <div class="zos_hint">关掉的话几条一起出来。<b>不管开不开,每条都是当场存好的</b>,
                     演到一半刷新或者切走都不会丢。</div>
 
-                <label class="zos_field">
-                    <span>停手几秒后对方才回</span>
-                    <input id="zos_reply_delay" type="number" min="0" max="60" class="text_pole" value="${settings.replyDelay}">
-                </label>
-                <div class="zos_hint">可以一口气连发好几条,停手这么多秒他才回。填 0 就是发一条回一条。
-                    输入框空着点「发送」= 不等了,让他马上回。</div>
 
                 <hr>
                 <b>线上线下联动</b>
@@ -2888,12 +2867,6 @@ function renderPanel() {
         }
     });
 
-    $(document).on('input', '#zos_reply_delay', function () {
-        const value = Number($(this).val());
-        if (!Number.isFinite(value) || value < 0) return;
-        getSettings().replyDelay = Math.min(60, Math.round(value));
-        saveSettingsDebounced();
-    });
 
     // 联动开关:关掉当场撤掉注入,不等下一轮
     $(document).on('input', '#zos_link_main', function () {
@@ -2920,7 +2893,6 @@ jQuery(async () => {
         loadLocal();
         // 换了一局,主线上下文里的手机聊天也跟着换
         refreshLink();
-        clearTimeout(replyTimer);
         if (jumping) return;
         if (!$('#zos_phone_wrap').hasClass('zos_hidden')) closePhone();
     });
