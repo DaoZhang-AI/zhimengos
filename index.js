@@ -26,14 +26,14 @@ import { ConnectionManagerRequestService } from '../../shared.js';
 // ⚠️ 这两个 import 后面的 ?v= 要跟着版本号一起改。
 // manifest 里的 ?v= 只管 index.js,管不到它 import 进来的文件,
 // 不带的话改了库文件浏览器还喂旧的那份。
-import { fuzzyAgo, fuzzyRange, displayTime } from './lib/fuzzy-time.js?v=0.14.2';
-import { maintain, buildMemoryText, describe, DEFAULTS as MEM_DEFAULTS } from './lib/rolling-summary.js?v=0.14.2';
+import { fuzzyAgo, fuzzyRange, displayTime } from './lib/fuzzy-time.js?v=0.14.3';
+import { maintain, buildMemoryText, describe, DEFAULTS as MEM_DEFAULTS } from './lib/rolling-summary.js?v=0.14.3';
 import { callGenericPopup, POPUP_TYPE } from '../../../popup.js';
 import { writeSecret, SECRET_KEYS } from '../../../secrets.js';
 import { uuidv4 } from '../../../utils.js';
 
 /** 跟 manifest.json 的 version 手动保持一致,靠这行在控制台辨认在跑哪一版 */
-const VERSION = '0.14.2';
+const VERSION = '0.14.3';
 
 /** 必须和仓库名、文件夹名一致,理由见织梦者里那段注释 */
 const MODULE_NAME = 'zhimengos';
@@ -88,6 +88,13 @@ function getSettings() {
     if (!settings.models || typeof settings.models !== 'object') settings.models = {};
     // 补齐后来新增的键,老用户升级时不至于缺
     settings.memory = { ...MEM_DEFAULTS, ...(settings.memory || {}) };
+    // 9/18 换成小步压:旧默认一次压 60 条的改成 8;摘要合并不再给人设,一律跟默认走
+    if (settings.memory.v !== 2) {
+        if (settings.memory.batchSize === 60) settings.memory.batchSize = MEM_DEFAULTS.batchSize;
+        settings.memory.v = 2;
+    }
+    settings.memory.compactAfter = MEM_DEFAULTS.compactAfter;
+    settings.memory.compactBatch = MEM_DEFAULTS.compactBatch;
     for (const k of ['replyDelay', 'linkMain']) {
         if (!(k in settings)) settings[k] = defaultSettings[k];
     }
@@ -2608,7 +2615,8 @@ async function onAddProfile() {
 function memoryExplain(mem) {
     const keep = Number(mem.keepRaw) || 0;
     const batch = Number(mem.batchSize) || 0;
-    return `也就是说:原话最多带 ${keep + batch} 条,压完还剩最近的 ${keep} 条原话。数字越大,模型看到的原话越多,每次发得也越长。`;
+    return `也就是说:原话攒到第 ${keep + batch} 条时,把最老的 ${batch} 条压成一段摘要,又回到 ${keep} 条。`
+        + '摘要多了以后,最老的几段会自动再合成一段,不用管。';
 }
 
 /** 手机里的 ⚙️ 设置页(道长 9/17:API 设置整体挪进手机自己的设置里)。
@@ -2688,19 +2696,13 @@ function renderSettings() {
                     发给模型的永远是「全部摘要 + 全部还没压的原话」,前后接得上,不会失忆。</div>
 
                 <div class="zos_field zos_range">
-                    <span>原话攒到</span>
-                    <input id="zos_raw_max" type="number" min="20" max="500" class="text_pole" value="${settings.memory.keepRaw + settings.memory.batchSize}">
-                    <span>条时,把最老的</span>
-                    <input id="zos_batch_size" type="number" min="10" max="490" class="text_pole" value="${settings.memory.batchSize}">
-                    <span>条压成一段摘要</span>
+                    <span>原话保留</span>
+                    <input id="zos_keep_raw" type="number" min="5" max="300" class="text_pole" value="${settings.memory.keepRaw}">
+                    <span>条,每多出</span>
+                    <input id="zos_batch_size" type="number" min="1" max="100" class="text_pole" value="${settings.memory.batchSize}">
+                    <span>条就压一次</span>
                 </div>
                 <div id="zos_mem_explain" class="zos_hint">${memoryExplain(settings.memory)}</div>
-
-                <div class="zos_field zos_range">
-                    <span>摘要攒到</span>
-                    <input id="zos_compact_after" type="number" min="3" max="40" class="text_pole" value="${settings.memory.compactAfter}">
-                    <span>段时,把最老的几段再合成一段</span>
-                </div>
                 <div class="zos_hint">写摘要用的是上面那条聊天连接,不用另选。
                     写摘要时发的是另一套要求:只写聊天里真有的事,不许补、不许猜,所以同一个模型也写得老实。</div>
 
@@ -2788,18 +2790,15 @@ function renderPanel() {
     $('#zos_self_check').on('click', () => checkSelfUpdate());
 
     // 界面上填的是「攒到多少条」和「压掉多少条」,存的还是 keepRaw(压完剩几条)和 batchSize
-    $(document).on('input', '#zos_raw_max, #zos_batch_size, #zos_compact_after', function () {
+    // 两个数:原话保留几条、每多出几条压一次(道长 9/18:选 40、每 8 条,到 48 就把 1-8 压掉)
+    $(document).on('input', '#zos_keep_raw, #zos_batch_size', function () {
         const mem = getSettings().memory;
-        const max = Math.round(Number($('#zos_raw_max').val()));
+        const keep = Math.round(Number($('#zos_keep_raw').val()));
         const batch = Math.round(Number($('#zos_batch_size').val()));
-        const compact = Math.round(Number($('#zos_compact_after').val()));
 
         // 填一半的时候别把设置写坏,等她填完再说
-        if (Number.isFinite(max) && Number.isFinite(batch) && batch >= 10 && max - batch >= 10) {
-            mem.batchSize = batch;
-            mem.keepRaw = max - batch;
-        }
-        if (Number.isFinite(compact) && compact >= 3) mem.compactAfter = compact;
+        if (Number.isFinite(keep) && keep >= 5) mem.keepRaw = keep;
+        if (Number.isFinite(batch) && batch >= 1) mem.batchSize = batch;
 
         $('#zos_mem_explain').html(memoryExplain(mem));
         saveSettingsDebounced();
