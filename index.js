@@ -26,14 +26,14 @@ import { ConnectionManagerRequestService } from '../../shared.js';
 // ⚠️ 这两个 import 后面的 ?v= 要跟着版本号一起改。
 // manifest 里的 ?v= 只管 index.js,管不到它 import 进来的文件,
 // 不带的话改了库文件浏览器还喂旧的那份。
-import { fuzzyAgo, fuzzyRange, displayTime } from './lib/fuzzy-time.js?v=0.14.1';
-import { maintain, buildMemoryText, describe, DEFAULTS as MEM_DEFAULTS } from './lib/rolling-summary.js?v=0.14.1';
+import { fuzzyAgo, fuzzyRange, displayTime } from './lib/fuzzy-time.js?v=0.14.2';
+import { maintain, buildMemoryText, describe, DEFAULTS as MEM_DEFAULTS } from './lib/rolling-summary.js?v=0.14.2';
 import { callGenericPopup, POPUP_TYPE } from '../../../popup.js';
 import { writeSecret, SECRET_KEYS } from '../../../secrets.js';
 import { uuidv4 } from '../../../utils.js';
 
 /** 跟 manifest.json 的 version 手动保持一致,靠这行在控制台辨认在跑哪一版 */
-const VERSION = '0.14.1';
+const VERSION = '0.14.2';
 
 /** 必须和仓库名、文件夹名一致,理由见织梦者里那段注释 */
 const MODULE_NAME = 'zhimengos';
@@ -73,10 +73,6 @@ const defaultSettings = {
     replyMax: 4,
     /** 回复一条一条往外冒,像真人在打字。嫌慢的人可以关掉 */
     typing: true,
-    /** 写摘要用哪条连接。空 = 和聊天用同一条。
-     *  单独一条的理由(2026-08-21 道长):**有人聊天爱用 flash,聊天还行,写摘要爱瞎写。**
-     *  聊天要的是语感,摘要要的是老实,这两件事本来就该允许用不同的模型。 */
-    summaryConnId: '',
     /** 她停手这么多秒之后对方才回。**允许连发好几条再等回复**(道长 9/17:不要强制一问一答) */
     replyDelay: 3,
     /** 手机里的线上聊天要不要进主线上下文(道长 9/17:这是最早定的需求,线上线下要联动) */
@@ -2262,13 +2258,18 @@ async function deliver(contact, lines, chatKey) {
 async function runMaintain(contact, chatKey) {
     const settings = getSettings();
 
-    // 摘要走自己那条连接。空的话 summaryConnId 是 '',而 runGeneration 的第三个参数
-    // 传 null 才表示"用聊天那条",所以这里要显式换算一下
-    const summaryConn = settings.summaryConnId || null;
-
+    // 摘要和聊天用同一条连接(道长 9/18:不该让用户为了摘要再配一个 api)。
+    // 管住它别编,靠的是换一套要求:要求放系统位,聊天记录放用户位,见 lib/rolling-summary.js
     const result = await maintain(
         contact,
-        prompt => runGeneration([{ role: 'user', content: prompt }], 600, summaryConn),
+        prompt => {
+            const SEP = '\n\n---\n';
+            const cut = prompt.indexOf(SEP);
+            const messages = cut < 0
+                ? [{ role: 'user', content: prompt }]
+                : [{ role: 'system', content: prompt.slice(0, cut) }, { role: 'user', content: prompt.slice(cut + SEP.length) }];
+            return runGeneration(messages, 600);
+        },
         { ...settings.memory, meName: '我', themName: contact.nick || '对方' });
 
     if (result.error) {
@@ -2414,38 +2415,7 @@ function renderConnectionOptions() {
     }
 
     $('#zos_conn').html(parts.join(''));
-    renderSummaryConnOptions(conns);
     renderConnectionDetail();
-}
-
-/** 摘要那条下拉。选项和聊天那条一样,只是头一项换成"和聊天用同一个" */
-function renderSummaryConnOptions(conns) {
-    const settings = getSettings();
-
-    if (settings.summaryConnId && !conns.some(c => c.id === settings.summaryConnId)) {
-        settings.summaryConnId = '';
-        saveSettingsDebounced();
-    }
-
-    const groups = new Map();
-    for (const c of conns) {
-        if (!groups.has(c.group)) groups.set(c.group, []);
-        groups.get(c.group).push(c);
-    }
-
-    const parts = [`<option value="" ${settings.summaryConnId ? '' : 'selected'}>和聊天用同一个</option>`];
-
-    for (const [group, items] of groups) {
-        parts.push(`<optgroup label="${escapeHtml(group)}">`);
-        for (const c of items) {
-            const selected = c.id === settings.summaryConnId ? 'selected' : '';
-            const mark = c.blocked ? ' (不能用)' : '';
-            parts.push(`<option value="${escapeHtml(c.id)}" ${selected}>${escapeHtml(c.name)}${mark}</option>`);
-        }
-        parts.push('</optgroup>');
-    }
-
-    $('#zos_sum_conn').html(parts.join(''));
 }
 
 /** 拉过的模型列表存在这台设备的 localStorage 里(几十个名字,不进 settings.json),下次打开设置页还在 */
@@ -2634,6 +2604,13 @@ async function onAddProfile() {
     }
 }
 
+/** 把两个数说成人话:压完剩几条、最多带几条 */
+function memoryExplain(mem) {
+    const keep = Number(mem.keepRaw) || 0;
+    const batch = Number(mem.batchSize) || 0;
+    return `也就是说:原话最多带 ${keep + batch} 条,压完还剩最近的 ${keep} 条原话。数字越大,模型看到的原话越多,每次发得也越长。`;
+}
+
 /** 手机里的 ⚙️ 设置页(道长 9/17:API 设置整体挪进手机自己的设置里)。
  *  元素 id 沿用原来抽屉里的,事件都委托在 document 上,所以每次重画不用重绑 */
 function renderSettings() {
@@ -2707,32 +2684,25 @@ function renderSettings() {
                     只带<b>这一局</b>的联系人;常驻联系人跨局共用,不进主线,免得串到别的故事里。</div>
                 <hr>
                 <b>记忆</b>
-                <div class="zos_hint">聊天记录不会被丢掉,而是<b>攒够一批就压成一段摘要</b>,
-                    还没摘要的原话全部原样带着(至少 N 条,最多 N + 一次摘掉的条数)。这样上下线都不会失忆,上下文也不会一直涨。
-                    <b>写摘要要花一次生成</b>,用的是上面选的那条连接。</div>
+                <div class="zos_hint">聊天记录不会丢。原话攒多了,就把最老的一批压成一段摘要,
+                    发给模型的永远是「全部摘要 + 全部还没压的原话」,前后接得上,不会失忆。</div>
 
-                <label class="zos_field">
-                    <span>永远保留多少条正文</span>
-                    <input id="zos_keep_raw" type="number" min="10" max="200" class="text_pole" value="${settings.memory.keepRaw}">
-                </label>
+                <div class="zos_field zos_range">
+                    <span>原话攒到</span>
+                    <input id="zos_raw_max" type="number" min="20" max="500" class="text_pole" value="${settings.memory.keepRaw + settings.memory.batchSize}">
+                    <span>条时,把最老的</span>
+                    <input id="zos_batch_size" type="number" min="10" max="490" class="text_pole" value="${settings.memory.batchSize}">
+                    <span>条压成一段摘要</span>
+                </div>
+                <div id="zos_mem_explain" class="zos_hint">${memoryExplain(settings.memory)}</div>
 
-                <label class="zos_field">
-                    <span>一次摘掉多少条</span>
-                    <input id="zos_batch_size" type="number" min="10" max="300" class="text_pole" value="${settings.memory.batchSize}">
-                </label>
-
-                <label class="zos_field">
-                    <span>摘要攒到几段就压一层</span>
+                <div class="zos_field zos_range">
+                    <span>摘要攒到</span>
                     <input id="zos_compact_after" type="number" min="3" max="40" class="text_pole" value="${settings.memory.compactAfter}">
-                </label>
-
-                <label class="zos_field">
-                    <span>写摘要用哪个连接</span>
-                    <select id="zos_sum_conn" class="text_pole"></select>
-                </label>
-                <div class="zos_hint">可以和聊天用不同的模型。<b>聊天要的是语感,摘要要的是老实</b>,
-                    有些模型聊天挺好但写摘要爱瞎编,那就在这儿单独换一个。
-                    模型跟着连接走,在上面那条连接里选过的模型这里照样生效。</div>
+                    <span>段时,把最老的几段再合成一段</span>
+                </div>
+                <div class="zos_hint">写摘要用的是上面那条聊天连接,不用另选。
+                    写摘要时发的是另一套要求:只写聊天里真有的事,不许补、不许猜,所以同一个模型也写得老实。</div>
 
                 <div class="zos_hint">摘要写歪了可以自己改:进某个联系人的设置,那里能看能改能删。</div>
 
@@ -2817,17 +2787,24 @@ function renderPanel() {
     $('#zos_open').on('click', () => togglePhone());
     $('#zos_self_check').on('click', () => checkSelfUpdate());
 
-    $(document).on('input', '#zos_keep_raw, #zos_batch_size, #zos_compact_after', function () {
-        const map = { zos_keep_raw: 'keepRaw', zos_batch_size: 'batchSize', zos_compact_after: 'compactAfter' };
-        const key = map[this.id];
-        const value = Number($(this).val());
+    // 界面上填的是「攒到多少条」和「压掉多少条」,存的还是 keepRaw(压完剩几条)和 batchSize
+    $(document).on('input', '#zos_raw_max, #zos_batch_size, #zos_compact_after', function () {
+        const mem = getSettings().memory;
+        const max = Math.round(Number($('#zos_raw_max').val()));
+        const batch = Math.round(Number($('#zos_batch_size').val()));
+        const compact = Math.round(Number($('#zos_compact_after').val()));
 
-        // 空着或者填了乱七八糟的东西时别把设置写坏,等她填完再说
-        if (!key || !Number.isFinite(value) || value <= 0) return;
+        // 填一半的时候别把设置写坏,等她填完再说
+        if (Number.isFinite(max) && Number.isFinite(batch) && batch >= 10 && max - batch >= 10) {
+            mem.batchSize = batch;
+            mem.keepRaw = max - batch;
+        }
+        if (Number.isFinite(compact) && compact >= 3) mem.compactAfter = compact;
 
-        getSettings().memory[key] = Math.round(value);
+        $('#zos_mem_explain').html(memoryExplain(mem));
         saveSettingsDebounced();
     });
+
     // 更新按钮是查完才画出来的,所以委托在容器上
     $('#zos_self_out').on('click', '#zos_self_update', () => doSelfUpdate());
 
@@ -2864,10 +2841,6 @@ function renderPanel() {
         saveSettingsDebounced();
     });
 
-    $(document).on('change', '#zos_sum_conn', function () {
-        getSettings().summaryConnId = String($(this).val() || '');
-        saveSettingsDebounced();
-    });
 
     $(document).on('change', '#zos_model', () => onPickModel());
     $(document).on('click', '#zos_load_models', () => onLoadModels());
