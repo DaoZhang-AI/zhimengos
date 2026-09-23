@@ -953,8 +953,8 @@ async function onRedo() {
     const run = lastThemRun(contact);
     if (!run.length) return void toastr.info('他还没回过,没得重说', '织梦OS');
 
+    // 删的是最新那一批,还没被压进摘要(摘要只压更早的),所以摘要不用动
     contact.messages.splice(run[0], run.length);
-    // 摘要是按原话条数滚的,删了原话要把它一起算回去,不然摘要里留着已经撤掉的话
     await saveContactFrom(contact, currentChatKey());
     renderScreen();
     refreshLink();
