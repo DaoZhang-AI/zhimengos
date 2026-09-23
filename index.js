@@ -26,14 +26,14 @@ import { ConnectionManagerRequestService } from '../../shared.js';
 // ⚠️ 这两个 import 后面的 ?v= 要跟着版本号一起改。
 // manifest 里的 ?v= 只管 index.js,管不到它 import 进来的文件,
 // 不带的话改了库文件浏览器还喂旧的那份。
-import { fuzzyAgo, fuzzyRange, displayTime } from './lib/fuzzy-time.js?v=0.16.0';
-import { maintain, buildMemoryText, describe, DEFAULTS as MEM_DEFAULTS } from './lib/rolling-summary.js?v=0.16.0';
+import { fuzzyAgo, fuzzyRange, displayTime } from './lib/fuzzy-time.js?v=0.16.1';
+import { maintain, buildMemoryText, describe, DEFAULTS as MEM_DEFAULTS } from './lib/rolling-summary.js?v=0.16.1';
 import { callGenericPopup, POPUP_TYPE } from '../../../popup.js';
 import { writeSecret, SECRET_KEYS } from '../../../secrets.js';
 import { uuidv4 } from '../../../utils.js';
 
 /** 跟 manifest.json 的 version 手动保持一致,靠这行在控制台辨认在跑哪一版 */
-const VERSION = '0.16.0';
+const VERSION = '0.16.1';
 
 /** 必须和仓库名、文件夹名一致,理由见织梦者里那段注释 */
 const MODULE_NAME = 'zhimengos';
@@ -961,9 +961,15 @@ async function onRedo() {
     requestReply(contact.id);
 }
 
+/** 菜单刚弹出来那一下:松手会补一个 click,别让它把菜单当场关掉
+ *  (道长 9/23 晚:操作条一瞬间就没了,得一直按着) */
+let menuJustOpened = false;
+
 /** 长按某一条弹出的小菜单 */
 function openMsgMenu(idx, anchor) {
     closeMsgMenu();
+    menuJustOpened = true;
+    setTimeout(() => { menuJustOpened = false; }, 350);
     const contact = contactById(openChatId);
     const m = contact?.messages?.[idx];
     if (!m) return;
@@ -1005,6 +1011,12 @@ async function onMsgAct(act, idx) {
         return void renderScreen();
     }
     if (act === '删除') {
+        // 删之前问一句(道长 9/23 晚:现在没有确认框,误触就没了)
+        const brief = m.text.length > 30 ? m.text.slice(0, 30) + '…' : m.text;
+        const ok = await callGenericPopup(
+            `<div class="zos_popup"><div>删掉这一条?</div><div class="zos_reason">${escapeHtml(brief)}</div></div>`,
+            POPUP_TYPE.CONFIRM, '', { okButton: '删', cancelButton: '算了' });
+        if (!ok) return;
         contact.messages.splice(idx, 1);
         await saveContactFrom(contact, currentChatKey());
         renderScreen();
@@ -1026,6 +1038,10 @@ async function onPickAct(act) {
         picking = false; picked = new Set();
         return void renderScreen();
     }
+    const ok = await callGenericPopup(
+        `<div class="zos_popup"><div>删掉选中的 ${idxs.length} 条?</div></div>`,
+        POPUP_TYPE.CONFIRM, '', { okButton: '删', cancelButton: '算了' });
+    if (!ok) return;
     // 从后往前删,免得删一条前面的把后面的下标顶掉
     for (const i of idxs.slice().reverse()) contact.messages.splice(i, 1);
     await saveContactFrom(contact, currentChatKey());
@@ -1377,8 +1393,17 @@ function renderScreen() {
     else if (screen === 'contact_edit') body = renderContactEdit();
     else if (screen === 'settings') body = renderSettings();
 
+    // 聊天窗重画要停在原地(道长 9/23 晚:删完一条视图蹦回最上面)。
+    // 进聊天窗那次由 goto 自己滚到底,这里只负责"重画不要动位置"
+    const keepScroll = screen === 'chat_room' ? document.querySelector('.zos_msgs')?.scrollTop : null;
+
     $('#zos_screen').html(body);
     $('#zos_phone').attr('data-screen', screen);
+
+    if (keepScroll != null) {
+        const box = document.querySelector('.zos_msgs');
+        if (box) box.scrollTop = keepScroll;
+    }
 
     // 设置页里的下拉要按当前连接现填
     if (screen === 'settings') renderConnectionOptions();
@@ -1490,6 +1515,8 @@ function buildPhone() {
     $('#zos_screen').on('contextmenu', '.zos_msg', event => event.preventDefault());
 
     $(document).on('click.zosmenu', event => {
+        // 长按松手时浏览器会补一个 click,那一下不算"点到别处"
+        if (menuJustOpened) return;
         if (!event.target.closest?.('.zos_msgmenu')) closeMsgMenu();
     });
     $(document).on('click', '.zos_msgmenu_item', function () {
