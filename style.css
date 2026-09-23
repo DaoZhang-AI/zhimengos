@@ -1162,3 +1162,89 @@
     cursor: pointer;
     margin: 0;
 }
+
+/* ==========================================================================
+ * 9/23:重 roll 键、长按菜单、多选
+ * ========================================================================== */
+
+.zos_redo {
+    font-size: 18px;
+    line-height: 1;
+    cursor: pointer;
+    color: var(--zos-ink);
+    opacity: 0.85;
+}
+
+.zos_redo.zos_dim {
+    opacity: 0.3;
+    cursor: default;
+}
+
+/* 长按弹出来的小菜单。挂在手机壳上,绝对定位,位置由 js 夹进屏幕 */
+.zos_msgmenu {
+    position: absolute;
+    z-index: 30;
+    display: flex;
+    overflow: hidden;
+    border-radius: 10px;
+    background-color: rgba(28, 28, 32, 0.96);
+    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.45);
+}
+
+.zos_msgmenu_item {
+    padding: 8px 12px;
+    font-size: 13px;
+    color: #f2f2f4;
+    cursor: pointer;
+    white-space: nowrap;
+}
+
+.zos_msgmenu_item + .zos_msgmenu_item {
+    border-left: 1px solid rgba(255, 255, 255, 0.12);
+}
+
+.zos_msgmenu_item:active {
+    background-color: rgba(255, 255, 255, 0.14);
+}
+
+/* 长按时别让系统自己的选词放大镜抢走(iPad 上尤其明显) */
+.zos_msg {
+    -webkit-touch-callout: none;
+    -webkit-user-select: none;
+    user-select: none;
+}
+
+.zos_msg_row.zos_picking {
+    cursor: pointer;
+}
+
+.zos_pick {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    padding-top: 6px;
+}
+
+.zos_pickbar {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 10px;
+    font-size: 12px;
+    color: var(--zos-ink);
+    border-top: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.zos_pillbtn {
+    padding: 5px 12px;
+    border-radius: 999px;
+    font-size: 12px;
+    cursor: pointer;
+    color: var(--zos-ink);
+    background-color: rgba(255, 255, 255, 0.12);
+}
+
+.zos_pillbtn:active {
+    background-color: rgba(255, 255, 255, 0.22);
+}

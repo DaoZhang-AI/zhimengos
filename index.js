@@ -26,14 +26,14 @@ import { ConnectionManagerRequestService } from '../../shared.js';
 // ⚠️ 这两个 import 后面的 ?v= 要跟着版本号一起改。
 // manifest 里的 ?v= 只管 index.js,管不到它 import 进来的文件,
 // 不带的话改了库文件浏览器还喂旧的那份。
-import { fuzzyAgo, fuzzyRange, displayTime } from './lib/fuzzy-time.js?v=0.15.1';
-import { maintain, buildMemoryText, describe, DEFAULTS as MEM_DEFAULTS } from './lib/rolling-summary.js?v=0.15.1';
+import { fuzzyAgo, fuzzyRange, displayTime } from './lib/fuzzy-time.js?v=0.16.0';
+import { maintain, buildMemoryText, describe, DEFAULTS as MEM_DEFAULTS } from './lib/rolling-summary.js?v=0.16.0';
 import { callGenericPopup, POPUP_TYPE } from '../../../popup.js';
 import { writeSecret, SECRET_KEYS } from '../../../secrets.js';
 import { uuidv4 } from '../../../utils.js';
 
 /** 跟 manifest.json 的 version 手动保持一致,靠这行在控制台辨认在跑哪一版 */
-const VERSION = '0.15.1';
+const VERSION = '0.16.0';
 
 /** 必须和仓库名、文件夹名一致,理由见织梦者里那段注释 */
 const MODULE_NAME = 'zhimengos';
@@ -890,17 +890,31 @@ function renderChatRoom() {
     const chat = contactById(openChatId);
     if (!chat) return renderChatList();
 
-    const bubbles = (chat.messages || []).map(m => renderBubble(m, chat)).join('');
+    const bubbles = (chat.messages || []).map((m, i) => renderBubble(m, chat, i)).join('');
 
     const empty = `<div class="zos_empty">还没有消息。<br>说点什么吧。</div>`;
+    // 重 roll:最后一批是对方说的才点得动(道长 9/23)
+    const canRedo = lastThemRun(chat).length > 0;
+    const pickBar = picking
+        ? `<div class="zos_pickbar">
+            <span>选了 ${picked.size} 条</span>
+            <div class="zos_pillbtn zos_pick_copy">复制</div>
+            <div class="zos_pillbtn zos_pick_del">删除</div>
+            <div class="zos_pillbtn zos_pick_cancel">取消</div>
+           </div>`
+        : '';
 
     return `
         <div class="zos_appbar">
             <div class="zos_back" data-to="chat_list">‹</div>
             <div class="zos_appbar_title">${escapeHtml(chat.nick || '')}</div>
-            <div class="zos_appbar_right"><div class="zos_more" title="联系人设置">⋯</div></div>
+            <div class="zos_appbar_right">
+                <div class="zos_redo${canRedo ? '' : ' zos_dim'}" title="${canRedo ? '重 roll:把他刚回的这一批删掉重说' : '他还没回过,没得重说'}">🔄</div>
+                <div class="zos_more" title="联系人设置">⋯</div>
+            </div>
         </div>
         <div class="zos_msgs">${chat.messages?.length ? bubbles : empty}</div>
+        ${pickBar}
         <div class="zos_plus_panel zos_hidden">
             <div class="zos_plus_item" data-kind="sticker"><div class="zos_plus_icon">😊</div>表情</div>
             <div class="zos_plus_item" data-kind="image"><div class="zos_plus_icon">🖼️</div>图片</div>
@@ -914,6 +928,133 @@ function renderChatRoom() {
             <input class="zos_input" type="text" placeholder="回车只发出去,点「发送」他才回">
             <div class="zos_send" title="点一下让他回;输入框里有字会先发出去">发送</div>
         </div>`;
+}
+
+/* ---------- 重 roll 与长按菜单(道长 9/23) ---------- */
+
+/** 多选状态:开着的时候每条前面有勾选框,底下出一条工具栏 */
+let picking = false;
+/** 选中的下标 */
+let picked = new Set();
+
+/** 末尾连着的那一批对方消息的下标。他一次回好几条,重 roll 要整批一起删 */
+function lastThemRun(contact) {
+    const list = contact?.messages ?? [];
+    const out = [];
+    for (let i = list.length - 1; i >= 0 && list[i].from !== 'me'; i--) out.unshift(i);
+    return out;
+}
+
+/** 重 roll:删掉他刚回的那一批,再让他重说一次 */
+async function onRedo() {
+    const contact = contactById(openChatId);
+    if (!contact) return;
+    if (sending) return void toastr.info('他正在回,等这一轮回完再点', '织梦OS');
+    const run = lastThemRun(contact);
+    if (!run.length) return void toastr.info('他还没回过,没得重说', '织梦OS');
+
+    contact.messages.splice(run[0], run.length);
+    // 摘要是按原话条数滚的,删了原话要把它一起算回去,不然摘要里留着已经撤掉的话
+    await saveContactFrom(contact, currentChatKey());
+    renderScreen();
+    refreshLink();
+    requestReply(contact.id);
+}
+
+/** 长按某一条弹出的小菜单 */
+function openMsgMenu(idx, anchor) {
+    closeMsgMenu();
+    const contact = contactById(openChatId);
+    const m = contact?.messages?.[idx];
+    if (!m) return;
+    const menu = document.createElement('div');
+    menu.className = 'zos_msgmenu';
+    menu.innerHTML = ['复制', '引用', '删除', '多选'].map(x => `<div class="zos_msgmenu_item" data-act="${x}">${x}</div>`).join('');
+    document.querySelector('#zos_phone')?.appendChild(menu);
+    // 贴着那条气泡放,再夹回手机屏幕里,免得贴边时露不全
+    const box = document.querySelector('#zos_phone').getBoundingClientRect();
+    const at = anchor.getBoundingClientRect();
+    const w = menu.offsetWidth || 160;
+    menu.style.left = Math.max(6, Math.min(box.width - w - 6, at.left - box.left)) + 'px';
+    menu.style.top = Math.max(6, at.top - box.top - menu.offsetHeight - 6) + 'px';
+    menu.dataset.idx = String(idx);
+}
+
+function closeMsgMenu() {
+    document.querySelectorAll('.zos_msgmenu').forEach(x => x.remove());
+}
+
+async function onMsgAct(act, idx) {
+    closeMsgMenu();
+    const contact = contactById(openChatId);
+    const m = contact?.messages?.[idx];
+    if (!m) return;
+    if (act === '复制') return void copyText(m.text);
+    if (act === '引用') {
+        const input = document.querySelector('.zos_input');
+        if (input) {
+            const brief = m.text.length > 16 ? m.text.slice(0, 16) + '…' : m.text;
+            input.value = `[引用「${brief}」] ` + String(input.value || '');
+            input.focus();
+        }
+        return;
+    }
+    if (act === '多选') {
+        picking = true;
+        picked = new Set([idx]);
+        return void renderScreen();
+    }
+    if (act === '删除') {
+        contact.messages.splice(idx, 1);
+        await saveContactFrom(contact, currentChatKey());
+        renderScreen();
+        refreshLink();
+    }
+}
+
+/** 多选工具栏:复制、删除、取消 */
+async function onPickAct(act) {
+    const contact = contactById(openChatId);
+    if (!contact) return;
+    const idxs = [...picked].sort((a, b) => a - b);
+    if (act === 'cancel' || !idxs.length) {
+        picking = false; picked = new Set();
+        return void renderScreen();
+    }
+    if (act === 'copy') {
+        copyText(idxs.map(i => contact.messages[i]?.text).filter(Boolean).join('\n'));
+        picking = false; picked = new Set();
+        return void renderScreen();
+    }
+    // 从后往前删,免得删一条前面的把后面的下标顶掉
+    for (const i of idxs.slice().reverse()) contact.messages.splice(i, 1);
+    await saveContactFrom(contact, currentChatKey());
+    picking = false; picked = new Set();
+    renderScreen();
+    refreshLink();
+}
+
+/** 剪贴板:酒馆在 http 下也跑,navigator.clipboard 可能没有,退回老办法 */
+function copyText(text) {
+    const s = String(text ?? '');
+    try {
+        if (navigator.clipboard?.writeText) {
+            navigator.clipboard.writeText(s).then(() => toastr.success('复制好了', '织梦OS'), () => fallbackCopy(s));
+            return;
+        }
+    } catch { /* 往下走老办法 */ }
+    fallbackCopy(s);
+}
+
+function fallbackCopy(s) {
+    const ta = document.createElement('textarea');
+    ta.value = s;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand('copy'); toastr.success('复制好了', '织梦OS'); } catch { toastr.error('复制不了,手动选一下吧', '织梦OS'); }
+    ta.remove();
 }
 
 /** 消息里的特殊种类:发出去的是带方括号标记的文字,模型看得懂,界面上换成图标 */
@@ -967,6 +1108,18 @@ function contactRealName(contact) {
     return card?.name || contact.nick || '对方';
 }
 
+/**
+ * 一键线下只决定正文写什么,不该动预设的输出格式(道长 9/23 报的两个:
+ * 点了一键线下之后头部状态栏跑到尾部状态栏前面,还会头尾各出现一个)。
+ * 这几句压在最后,因为末尾的要求模型最听得进去。
+ * 写法上不认任何具体预设的标签名,只说"顺序照旧、每块只出现一次",换预设也不会失效。
+ */
+const KEEP_FORMAT = [
+    '',
+    '这一层的输出格式和平时完全一样:该在正文前面的照旧在正文前面,该在正文后面的照旧在后面,顺序一个都不许调。',
+    '每一块都只输出一次,不要因为上面这些要求就重复、补写或者挪动其中任何一块。',
+];
+
 function buildOfflinePrompt(contact, mode) {
     const userName = getContext().name1 || '我';
     const charName = contactRealName(contact);
@@ -994,7 +1147,7 @@ function buildOfflinePrompt(contact, mode) {
             '聊天本身已经发生过了,不要在正文里重写或复述这段聊天。',
         ];
 
-    return [...head, ...ask, `不要替${userName}做任何动作、说任何话。`].join(LF);
+    return [...head, ...ask, `不要替${userName}做任何动作、说任何话。`, ...KEEP_FORMAT].join(LF);
 }
 
 async function goOffline(contact, mode) {
@@ -1107,7 +1260,7 @@ function refreshLink() {
 }
 
 /** 两边头像常驻(道长 9/17):对方在左,自己在右 */
-function renderBubble(m, contact) {
+function renderBubble(m, contact, idx = -1) {
     const mine = m.from === 'me';
     const src = mine ? (user_avatar ? getThumbnailUrl('persona', user_avatar) : '') : avatarOf(contact);
     const fallback = mine ? '我' : (contact.nick || '?').slice(0, 1);
@@ -1117,8 +1270,11 @@ function renderBubble(m, contact) {
         ? `<div class="zos_bubble zos_bubble_card"><span class="zos_card_icon">${KIND_ICONS[kind.mark]}</span><span><span class="zos_card_mark">${kind.mark}</span>${escapeHtml(kind.body)}</span></div>`
         : `<div class="zos_bubble">${escapeHtml(m.text)}</div>`;
 
+    // 长按和多选都按下标认人,所以每行都要带上它(道长 9/23 要的长按菜单)
+    const pick = picking ? `<div class="zos_pick"><input type="checkbox" class="zos_pick_box"${picked.has(idx) ? ' checked' : ''}></div>` : '';
     return `
-        <div class="zos_msg_row zos_msg_row_${mine ? 'me' : 'them'}">
+        <div class="zos_msg_row zos_msg_row_${mine ? 'me' : 'them'}${picking ? ' zos_picking' : ''}" data-idx="${idx}">
+            ${pick}
             ${mine ? '' : avatar}
             <div class="zos_msg zos_msg_${mine ? 'me' : 'them'}">
                 ${inner}
@@ -1231,6 +1387,10 @@ function renderScreen() {
 function goto(next, chatId = null) {
     screen = next;
     if (chatId) openChatId = chatId;
+    // 换页就退出多选,免得回来还勾着(下标也早不是原来那几条了)
+    picking = false;
+    picked = new Set();
+    closeMsgMenu();
     renderScreen();
 
     // 进聊天窗默认看最新的那条,和真手机一样
@@ -1307,6 +1467,43 @@ function buildPhone() {
     });
 
     $('#zos_screen').on('click', '.zos_send', () => onSend());
+    $('#zos_screen').on('click', '.zos_redo', () => onRedo());
+
+    /* 长按消息:删除 / 引用 / 多选 / 复制(道长 9/23)。
+     * 手指和鼠标都走这一套:按下计时 500 毫秒,中途松手或者滑动超过 10 像素就当没长按。
+     * iPad 上还要挡掉系统自己的"选中文字"放大镜,不然菜单一出来就被它盖住。 */
+    let pressTimer = null;
+    let pressAt = null;
+    const cancelPress = () => { clearTimeout(pressTimer); pressTimer = null; pressAt = null; };
+    $('#zos_screen').on('pointerdown', '.zos_msg', function (event) {
+        if (picking) return;
+        const row = this.closest('.zos_msg_row');
+        const idx = Number(row?.dataset.idx ?? -1);
+        if (!(idx >= 0)) return;
+        pressAt = { x: event.clientX, y: event.clientY };
+        pressTimer = setTimeout(() => { pressTimer = null; openMsgMenu(idx, row); }, 500);
+    });
+    $('#zos_screen').on('pointermove', '.zos_msg', function (event) {
+        if (pressAt && Math.hypot(event.clientX - pressAt.x, event.clientY - pressAt.y) > 10) cancelPress();
+    });
+    $('#zos_screen').on('pointerup pointercancel pointerleave', '.zos_msg', cancelPress);
+    $('#zos_screen').on('contextmenu', '.zos_msg', event => event.preventDefault());
+
+    $(document).on('click.zosmenu', event => {
+        if (!event.target.closest?.('.zos_msgmenu')) closeMsgMenu();
+    });
+    $(document).on('click', '.zos_msgmenu_item', function () {
+        onMsgAct(String($(this).data('act')), Number($(this).closest('.zos_msgmenu').attr('data-idx')));
+    });
+    $('#zos_screen').on('click', '.zos_msg_row.zos_picking', function (event) {
+        if (event.target.closest('.zos_pickbar')) return;
+        const idx = Number(this.dataset.idx);
+        if (picked.has(idx)) picked.delete(idx); else picked.add(idx);
+        renderScreen();
+    });
+    $('#zos_screen').on('click', '.zos_pick_copy', () => onPickAct('copy'));
+    $('#zos_screen').on('click', '.zos_pick_del', () => onPickAct('del'));
+    $('#zos_screen').on('click', '.zos_pick_cancel', () => onPickAct('cancel'));
     // 道长 9/18:回车只发出去、不叫他回;点「发送」按钮才让他回。3 秒自动回太短,改成她自己说了算
     $('#zos_screen').on('keydown', '.zos_input', function (event) {
         if (event.key === 'Enter' && !event.isComposing) {
@@ -2137,7 +2334,9 @@ function typingDelayFor(text) {
 
 function appendBubble(message, contact) {
     $('.zos_msgs .zos_empty').remove();
-    $('.zos_msgs').append(renderBubble(message, contact || contactById(openChatId) || {}));
+    const c = contact || contactById(openChatId) || {};
+    // 下标要跟数组对上,长按和多选都靠它
+    $('.zos_msgs').append(renderBubble(message, c, Math.max(0, (c.messages?.length ?? 1) - 1)));
     scrollMessagesToEnd();
 }
 
